@@ -1,21 +1,28 @@
-/* Fractal Tetris: the real port plays at 160x144, and EVERY pixel of that
- * screen is itself a live micro-Tetris played by a dumb AI — simulated
- * entirely on the GPU, ~23k concurrent games in two fragment-shader passes
- * over ping-ponged state textures.
+/* Fractetris: the main game plays at 160x144, and EVERY pixel of that
+ * screen is itself a live micro-game — simulated entirely on the GPU.
  *
- * The micro-games run the PORTED RULES, not an approximation: 10x18 board,
- * the real 21-level gravity table, the original RNG (16-bit LCG standing in
- * for rDIV + the mod-7 wrap loop + the 2-reroll anti-repeat quirk), piece
- * pipeline (active/preview/hidden), lock -> scan -> blink (7 phases x 10
- * frames) -> settle -> wipe timing, level = lines/10 progression, top-out on
- * the 2nd spawn lock, and the game-over curtain filling the board row by
- * row before the game restarts. Menus are skipped: every game starts on the
- * board. Each game plays grayscale, tinted by its main-game pixel color.
+ * The micro-games are a FULL PORT of the C game loop to GLSL (Doom-in-a-
+ * shader style): the entire game state lives in textures and each frame is
+ * a pure step function, executed identically in three passes (registers,
+ * logic board, display board). Faithful details:
+ *
+ *  - dual board layers per game, like the original hardware: logic reads
+ *    the "shadow" (WRAM) layer while the clear-blink, curtain and wipe
+ *    animations write the "display" (VRAM) layer
+ *  - the AI is a virtual player: it emits held/pressed button bytes that
+ *    run through the real input code — DAS 23/9 auto-shift, tap-rotation
+ *    with revert-on-collision, genuine soft drop with its scoring
+ *  - exact per-frame call order and stage timings from the C port:
+ *    rotate -> drop -> scan -> merge -> shift -> timers -> blink -> wipe;
+ *    2-frame ARE, 7x10-frame blink (grey/restore from shadow, then clear),
+ *    13-frame settle, 18-frame progressive wipe redraw, line score applied
+ *    at wipe step 5, level-up check at wipe step 16
+ *  - the real piece RNG (16-bit LCG -> mod-7 wrap -> 2-reroll anti-repeat),
+ *    spawn-lock top-out rule, and the row-per-frame game-over curtain
  *
  * Keyboard plays the big game; wheel zooms at cursor, drag pans,
- * =/- zoom, Home resets.
- *
- * Single translation unit: includes the whole port below. */
+ * =/- zoom, Home resets. Single translation unit: includes the whole port.
+ */
 
 #define TETRIS_NO_MAIN
 #include "../src/assets.c"
@@ -32,11 +39,11 @@
 #endif
 
 #define FRAME_HZ 59.7275
-#define GAMES_X GB_W /* one micro-game per big-game pixel */
+#define GAMES_X GB_W
 #define GAMES_Y GB_H
-#define MB_W 10 /* the real playfield */
+#define MB_W 10
 #define MB_H 18
-#define REG_TEXELS 4 /* register texels per game */
+#define REG_TEXELS 5
 
 static SDL_Window *win;
 static SDL_GLContext glctx;
@@ -45,8 +52,9 @@ static int running = 1;
 
 static uint32_t fb[GB_W * GB_H];
 
-static GLuint prog_reg, prog_board, prog_show;
-static GLuint tex_big, tex_board[2], tex_reg[2], tex_tiles;
+static GLuint prog_reg, prog_shadow, prog_disp, prog_show;
+static GLuint tex_big, tex_tiles;
+static GLuint tex_reg[2], tex_shadow[2], tex_disp[2];
 static GLuint fbo;
 static GLuint vao;
 static int cur;
@@ -55,7 +63,6 @@ static int frame_no;
 static double cam_x = GAMES_X / 2.0, cam_y = GAMES_Y / 2.0, cam_scale = 8.0;
 static int dragging;
 
-/* fit the whole 160x144 wall of games in the window */
 static void fit_view(void)
 {
     cam_x = GAMES_X / 2.0;
@@ -75,218 +82,278 @@ static const char *VS =
     "vec2 p=vec2((gl_VertexID<<1&2),(gl_VertexID&2));"
     "gl_Position=vec4(p*2.0-1.0,0.0,1.0);}";
 
-/* Register layout, 3 RGBA8 texels per game at (g.x*3+k, g.y):
- * T0: R = (x+1) | rot<<4      x: piece col -1..9
- *     G = y+2                 y: piece row -2..17
- *     B = id | prev<<3        piece ids 0..6
- *     A = gravity timer 0..52
- * T1: R = lines (caps 250)
- *     G = level | stage<<5    stage: 0 fall, 2 post-lock wait, 3 blink,
- *                                    4 settle, 5 wipe, 6 curtain, 7 dead
- *     B = counter | next<<5   counter: blink phase / wipe step / curtain row
- *     A = timer | failed<<7
- * T2: R,G = 16-bit LCG state
- *     B = (tgt+1) | drot<<4   AI target column and desired rotation
- * T3: R,G,B = 24-bit score (real formula, capped 999999)
+/* Register layout, 5 RGBA8 texels per game:
+ * T0: R=(x+1)|rot<<4  G=y+2  B=id|prev<<3|armed<<6|failed<<7
+ *     A=nxt|lock<<3|blink<<5
+ * T1: R=gravtimer  G=das|t2<<5  B=timer1  A=wipe|kind<<5
+ * T2: R,G=rng  B=(tgt+1)|drot<<4  A=prev held buttons
+ * T3: R=lines  G=level|mode<<5 (mode 0 play, 1 curtain, 2 over)
+ *     B=softdrop count  A=curtain row
+ * T4: R,G,B=score
  *
- * Both sim passes recompute the SAME deterministic step; the board pass
- * turns the step's action into cell writes. */
+ * All three passes execute the same step() on the same old state, so their
+ * outputs can never disagree. */
 #define SIM_COMMON \
     "#version 300 es\n" \
     "precision highp float; precision highp int;\n" \
-    "uniform sampler2D uBoard; uniform sampler2D uReg; uniform int uFrame;\n" \
-    "uniform int uPass;\n" /* 0 = registers, 1 = board */ \
+    "uniform sampler2D uShadow; uniform sampler2D uDisp;" \
+    "uniform sampler2D uReg; uniform int uFrame; uniform int uPass;\n" \
     "const uint P[28]=uint[28](" \
-    "0x1700u,0x6220u,0x0740u,0x2230u," /* L */ \
-    "0x4700u,0x2260u,0x0710u,0x3220u," /* J */ \
-    "0x0F00u,0x2222u,0x0F00u,0x2222u," /* I */ \
-    "0x6600u,0x6600u,0x6600u,0x6600u," /* O */ \
-    "0x6300u,0x1320u,0x6300u,0x1320u," /* Z */ \
-    "0x3600u,0x2310u,0x3600u,0x2310u," /* S */ \
-    "0x2700u,0x2620u,0x0720u,0x2320u);" /* T */ \
+    "0x1700u,0x6220u,0x0740u,0x2230u,0x4700u,0x2260u,0x0710u,0x3220u," \
+    "0x0F00u,0x2222u,0x0F00u,0x2222u,0x6600u,0x6600u,0x6600u,0x6600u," \
+    "0x6300u,0x1320u,0x6300u,0x1320u,0x3600u,0x2310u,0x3600u,0x2310u," \
+    "0x2700u,0x2620u,0x0720u,0x2320u);\n" \
     "const int GRAV[21]=int[21](52,48,44,40,36,32,27,21,16,10,9,8,7,6,5," \
     "5,4,4,3,3,2);\n" \
+    "const int TILE[7]=int[7](20,17,0,19,18,22,21);\n" \
+    "int tileFor(int id,int rot,int r,int c){" \
+    "if(id==2){if((rot&1)==0)return c==0?26:(c==3?31:27);" \
+    "return r==0?16:(r==3?25:24);}return TILE[id];}\n" \
     "uint hsh(uint x){x^=x>>16u;x*=0x7feb352du;x^=x>>15u;x*=0x846ca68bu;" \
     "x^=x>>16u;return x;}\n" \
     "bool pcell(uint m,int r,int c){return (m>>uint(r*4+c)&1u)!=0u;}\n" \
-    "bool bfill(ivec2 g,int r,int c){" \
-    "return texelFetch(uBoard,ivec2(g.x*10+c,g.y*18+r),0).r>0.5;}\n" \
-    /* real collision rule incl. the above-field-is-solid quirk */ \
+    "bool sfill(ivec2 g,int r,int c){" \
+    "return texelFetch(uShadow,ivec2(g.x*10+c,g.y*18+r),0).r>0.5;}\n" \
+    "vec4 scell(ivec2 g,int r,int c){" \
+    "return texelFetch(uShadow,ivec2(g.x*10+c,g.y*18+r),0);}\n" \
     "bool hit(ivec2 g,uint m,int x,int y){" \
     "for(int r=0;r<4;r++)for(int c=0;c<4;c++){if(!pcell(m,r,c))continue;" \
     "int br=y+r,bc=x+c;" \
     "if(br<0||br>17||bc<0||bc>9)return true;" \
-    "if(bfill(g,br,bc))return true;}return false;}\n" \
-    "struct GS{int x;int rot;int id;int prev;int nxt;int grav;" \
-    "int lines;int level;int stage;int cntr;int timer;int failed;" \
-    "int y;uint rng;int tgt;int drot;int score;};\n" \
+    "if(sfill(g,br,bc))return true;}return false;}\n" \
+    /* faithful bug: full-line scan covers rows 2..17 only */ \
+    "bool rowfull(ivec2 g,int r){if(r<2)return false;" \
+    "for(int c=0;c<10;c++)if(!sfill(g,r,c))return false;return true;}\n" \
+    "int countfull(ivec2 g){int n=0;" \
+    "for(int r=2;r<18;r++)if(rowfull(g,r))n++;return n;}\n" \
+    /* shadow row content after removing full rows (compaction) */ \
+    "vec4 shifted(ivec2 g,int dr,int c){" \
+    "int d=17;" \
+    "for(int s=17;s>=0;s--){if(rowfull(g,s))continue;" \
+    "if(d==dr)return scell(g,s,c);d--;}" \
+    "return vec4(0.0);}\n" \
+    "struct GS{int x;int rot;int y;int id;int prev;int nxt;int armed;" \
+    "int failed;int lockst;int blink;int grav;int das;int t2;int t1;" \
+    "int wipe;int kind;uint rng;int tgt;int drot;int held0;int lines;" \
+    "int level;int mode;int sd;int crow;int score;};\n" \
     "GS load(ivec2 g){GS s;" \
-    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*4,g.y),0)*255.0+0.5);" \
-    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*4+1,g.y),0)*255.0+0.5);" \
-    "ivec4 c=ivec4(texelFetch(uReg,ivec2(g.x*4+2,g.y),0)*255.0+0.5);" \
-    "ivec4 d=ivec4(texelFetch(uReg,ivec2(g.x*4+3,g.y),0)*255.0+0.5);" \
-    "s.x=(a.r&15)-1;s.rot=a.r>>4;s.y=a.g-2;s.id=a.b&7;s.prev=a.b>>3;" \
-    "s.grav=a.a;s.lines=b.r;s.level=b.g&31;s.stage=b.g>>5;" \
-    "s.cntr=b.b&31;s.nxt=b.b>>5;s.timer=b.a&127;s.failed=b.a>>7;" \
+    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*5,g.y),0)*255.0+0.5);" \
+    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*5+1,g.y),0)*255.0+0.5);" \
+    "ivec4 c=ivec4(texelFetch(uReg,ivec2(g.x*5+2,g.y),0)*255.0+0.5);" \
+    "ivec4 d=ivec4(texelFetch(uReg,ivec2(g.x*5+3,g.y),0)*255.0+0.5);" \
+    "ivec4 e=ivec4(texelFetch(uReg,ivec2(g.x*5+4,g.y),0)*255.0+0.5);" \
+    "s.x=(a.r&15)-1;s.rot=a.r>>4;s.y=a.g-2;" \
+    "s.id=a.b&7;s.prev=a.b>>3&7;s.armed=a.b>>6&1;s.failed=a.b>>7;" \
+    "s.nxt=a.a&7;s.lockst=a.a>>3&3;s.blink=a.a>>5;" \
+    "s.grav=b.r;s.das=b.g&31;s.t2=b.g>>5;s.t1=b.b;" \
+    "s.wipe=b.a&31;s.kind=b.a>>5;" \
     "s.rng=uint(c.r)|uint(c.g)<<8;s.tgt=(c.b&15)-1;s.drot=c.b>>4;" \
-    "s.score=d.r|d.g<<8|d.b<<16;" \
+    "s.held0=c.a;" \
+    "s.lines=d.r;s.level=d.g&31;s.mode=d.g>>5;s.sd=d.b;s.crow=d.a;" \
+    "s.score=e.r|e.g<<8|e.b<<16;" \
     "return s;}\n" \
-    /* the ported RNG: LCG -> DIV byte -> mod-7 wrap loop */ \
+    /* the ported RNG chain */ \
     "int rndpiece(inout uint rng){" \
     "rng=(rng*25173u+13849u)&0xFFFFu;" \
     "uint b=rng>>8u;int a=0;" \
     "for(int i=0;i<256;i++){b=(b-1u)&255u;if(b==0u)break;" \
     "a++;if(a==7)a=0;}return a;}\n" \
-    /* placement search: simulate every (rotation, column), score the
-     * landing. Runs only in the register pass — the board pass never
-     * stores tgt/drot, so it skips the expensive part. */ \
-    "void choose(ivec2 g,int id,inout uint rng,out int btgt,out int brot){" \
-    "btgt=2;brot=0;int best=-1000000;" \
+    /* placement search, register pass only */ \
+    "void choose(ivec2 g,int id,inout uint rng,out int bt,out int br2){" \
+    "bt=2;br2=0;int best=-1000000;" \
     "rng=(rng*25173u+13849u)&0xFFFFu;" \
     "for(int rot=0;rot<4;rot++){uint m=P[id*4+rot];" \
     "for(int x=-1;x<=8;x++){" \
     "int y=-2;if(hit(g,m,x,y))continue;" \
     "for(int i=0;i<20;i++){if(hit(g,m,x,y+1))break;y++;}" \
-    "int sc=y*3;" /* land low */ \
-    "for(int r=0;r<4;r++){int br=y+r;if(br<0||br>17)continue;" \
+    "int sc=y*3;" \
+    "for(int r=0;r<4;r++){int rr=y+r;if(rr<0||rr>17)continue;" \
     "bool has=false,full=true;" \
-    "for(int c=0;c<10;c++){bool f=bfill(g,br,c);" \
+    "for(int c=0;c<10;c++){bool f=sfill(g,rr,c);" \
     "int pc=c-x;" \
     "if(!f&&pc>=0&&pc<4&&pcell(m,r,pc)){f=true;has=true;}" \
     "if(!f){full=false;break;}}" \
-    "if(full&&has)sc+=120;}" /* completing lines is the point */ \
+    "if(full&&has)sc+=120;}" \
     "for(int c=0;c<4;c++){int low=-1;" \
     "for(int r=0;r<4;r++)if(pcell(m,r,c))low=r;" \
     "if(low<0)continue;int bc=x+c;" \
-    "for(int br=y+low+1;br<18;br++){" \
-    "if(bfill(g,br,bc))break;sc-=12;}}" /* buried holes hurt */ \
+    "for(int rr=y+low+1;rr<18;rr++){" \
+    "if(sfill(g,rr,bc))break;sc-=12;}}" \
     "if(sc>best||(sc==best&&(rng>>uint(4+rot)&1u)==1u))" \
-    "{best=sc;btgt=x;brot=rot;}}}}\n" \
-    /* NextPiece with the original 2-reroll anti-repeat quirk */ \
-    "void nextpiece(inout GS s,ivec2 g){" \
+    "{best=sc;bt=x;br2=rot;}}}}\n" \
+    /* NextPiece: exact pipeline + reroll quirk */ \
+    "void nextpiece(ivec2 g,inout GS s){" \
     "s.id=s.prev;s.prev=s.nxt;" \
     "int d=0;int e=s.prev;int c=s.id;" \
     "for(int h=3;h>0;h--){d=rndpiece(s.rng);" \
     "if(h==1)break;if((d|e|c)!=c)break;}" \
-    "s.nxt=d;" \
-    "s.x=2;s.y=-2;s.rot=0;" \
-    "s.grav=GRAV[min(s.level,20)];" \
+    "s.nxt=d;s.x=2;s.y=-2;s.rot=0;" \
+    "s.armed=0;s.sd=0;s.grav=GRAV[min(s.level,20)];" \
     "if(uPass==0)choose(g,s.id,s.rng,s.tgt,s.drot);" \
     "else{s.rng=(s.rng*25173u+13849u)&0xFFFFu;s.tgt=2;s.drot=0;}}\n" \
-    /* actions the board pass must apply this frame */ \
-    "const int ACT_NONE=0,ACT_MERGE=1,ACT_REMOVE=2,ACT_CURTAIN=3," \
-    "ACT_CLEAR=4;\n" \
-    /* real per-cell tile ids (atlas index = tile id - 0x70); the I piece \
-     * uses its composite end/middle tiles like the original */ \
-    "const int TILE[7]=int[7](20,17,0,19,18,22,21);\n" \
-    "int tileFor(int id,int rot,int r,int c){" \
-    "if(id==2){if((rot&1)==0)return c==0?26:(c==3?31:27);" \
-    "return r==0?16:(r==3?25:24);}return TILE[id];}\n" \
-    "int fullrows(ivec2 g){int n=0;" \
-    "for(int r=0;r<18;r++){bool f=true;" \
-    "for(int c=0;c<10;c++)if(!bfill(g,r,c)){f=false;break;}" \
-    "if(f)n++;}return n;}\n" \
-    /* one frame of the ported rules; identical in both passes */ \
-    "int gstep(ivec2 g,inout GS s,out int actrow){" \
-    "actrow=0;uint gid=uint(g.y*512+g.x);" \
-    "if(s.stage==0){" \
-    /* dumb AI on the real movement rules (rotate = B-button dir) */ \
-    "if((uFrame+int(gid))%3==0){" \
-    "uint m2=P[s.id*4+((s.rot+1)&3)];" \
-    "if(s.rot!=s.drot){if(!hit(g,m2,s.x,s.y))s.rot=(s.rot+1)&3;}" \
-    "else if(s.x<s.tgt){if(!hit(g,P[s.id*4+s.rot],s.x+1,s.y))s.x++;}" \
-    "else if(s.x>s.tgt){if(!hit(g,P[s.id*4+s.rot],s.x-1,s.y))s.x--;}}" \
-    "s.grav--;" \
-    "if(s.grav<=0){s.grav=GRAV[min(s.level,20)];" \
-    "if(hit(g,P[s.id*4+s.rot],s.x,s.y+1)){" \
-    /* lock; real top-out rule: 2nd lock at the spawn position */ \
-    "bool atspawn=(s.x==2&&s.y==-2);" \
-    "if(atspawn&&s.failed==1){s.stage=6;s.cntr=0;return ACT_MERGE;}" \
-    "if(atspawn)s.failed=1;" \
-    "s.stage=2;s.timer=2;return ACT_MERGE;}" \
-    "else s.y++;}" \
-    "return ACT_NONE;}" \
-    "if(s.stage==2){s.timer--;if(s.timer>0)return ACT_NONE;" \
-    "int n=fullrows(g);" \
-    "if(n==0){nextpiece(s,g);s.stage=0;return ACT_NONE;}" \
-    "s.lines=min(s.lines+n,250);" \
-    "s.stage=3;s.cntr=0;s.timer=10;return ACT_NONE;}" \
-    "if(s.stage==3){s.timer--;if(s.timer>0)return ACT_NONE;" \
-    "s.cntr++;s.timer=10;" \
-    "if(s.cntr<7)return ACT_NONE;" \
-    /* blink over: score with the real formula, remove rows, settle 13, \
-     * wipe 18 (real cadence) */ \
-    "int n=fullrows(g);" \
-    "if(n>0){int base=n==1?40:n==2?100:n==3?300:1200;" \
-    "s.score=min(s.score+base*(s.level+1),999999);}" \
-    "s.stage=4;s.timer=13;return ACT_REMOVE;}" \
-    "if(s.stage==4){s.timer--;if(s.timer>0)return ACT_NONE;" \
-    "s.stage=5;s.cntr=0;return ACT_NONE;}" \
-    "if(s.stage==5){s.cntr++;" \
-    "if(s.cntr==16&&s.level<20&&s.lines/10>s.level)s.level++;" \
-    "if(s.cntr>=18){nextpiece(s,g);s.stage=0;}" \
-    "return ACT_NONE;}" \
-    "if(s.stage==6){" /* curtain: one row per frame, bottom-up */ \
-    "actrow=17-s.cntr;s.cntr++;" \
-    "if(s.cntr>=18){s.stage=7;s.timer=70;}" \
-    "return ACT_CURTAIN;}" \
-    "if(s.stage==7){s.timer--;" \
-    "if(s.timer>0)return ACT_NONE;" \
-    /* restart: fresh game, new random start level 0-9 */ \
+    /* board-pass action flags */ \
+    "const int A_MERGE=1,A_GREY=2,A_RESTORE=4,A_CLEAR=8,A_SHIFT=16," \
+    "A_WIPEROW=32,A_CURTAIN=64,A_RESET=128;\n" \
+    "const int B_A=1,B_B=2,B_R=16,B_L=32,B_D=128;\n" \
+    /* ==== one frame, ported line-for-line from game.c ST_PLAY ==== */ \
+    "int gstep(ivec2 g,inout GS s,out int wiperow,out uint lockm," \
+    "out int lx,out int ly,out int lid,out int lrot){" \
+    "int act=0;wiperow=0;lockm=0u;lx=0;ly=0;lid=0;lrot=0;" \
+    "uint gid=uint(g.y*512+g.x);" \
+    /* --- virtual player: buttons through the real input path --- */ \
+    "int held=0;" \
+    "if(s.mode==0&&s.lockst==0&&s.wipe==0){" \
+    "if(s.x>s.tgt)held|=B_L;else if(s.x<s.tgt)held|=B_R;" \
+    "else if(s.rot!=s.drot){if(((uFrame+int(gid))&7)<1)held|=B_B;}" \
+    "else held|=B_D;}" \
+    "int pressed=held&~s.held0;s.held0=held;" \
+    /* --- game over: curtain, wait, restart --- */ \
+    "if(s.mode==1){" \
+    "wiperow=17-s.crow;s.crow++;" \
+    "if(s.crow>=18){s.mode=2;s.t1=70;}" \
+    "return A_CURTAIN;}" \
+    "if(s.mode==2){if(s.t1>0){s.t1--;return 0;}" \
     "s.rng=(hsh(gid^uint(uFrame))&0xFFFFu)|1u;" \
-    "s.lines=0;s.failed=0;s.score=0;" \
+    "s.lines=0;s.failed=0;s.score=0;s.mode=0;s.crow=0;" \
     "s.level=int(hsh(gid^uint(uFrame)^0xBEEFu)%10u);" \
+    "s.lockst=0;s.blink=0;s.wipe=0;s.kind=0;s.t1=0;s.t2=0;s.das=0;" \
     "s.prev=rndpiece(s.rng);s.nxt=rndpiece(s.rng);" \
-    "nextpiece(s,g);s.stage=0;" \
-    "return ACT_CLEAR;}" \
-    "return ACT_NONE;}\n"
+    "nextpiece(g,s);" \
+    "return A_RESET;}" \
+    /* --- rotate_and_shift: rotation + DAS, real timings --- */ \
+    "if(s.lockst==0&&s.wipe==0){" \
+    "int old=s.rot;" \
+    "if((pressed&B_A)!=0)s.rot=(s.rot-1)&3;" \
+    "else if((pressed&B_B)!=0)s.rot=(s.rot+1)&3;" \
+    "if(s.rot!=old&&hit(g,P[s.id*4+s.rot],s.x,s.y))s.rot=old;" \
+    "int dir=0;" \
+    "if((held&B_R)!=0){" \
+    "if((pressed&B_R)!=0){dir=1;s.das=23;}" \
+    "else{s.das--;if(s.das<=0){dir=1;s.das=9;}}}" \
+    "else if((held&B_L)!=0){" \
+    "if((pressed&B_L)!=0){dir=-1;s.das=23;}" \
+    "else{s.das--;if(s.das<=0){dir=-1;s.das=9;}}}" \
+    "if(dir!=0){" \
+    "if(hit(g,P[s.id*4+s.rot],s.x+dir,s.y))s.das=1;" \
+    "else s.x+=dir;}}" \
+    /* --- drop_piece: soft drop + independent gravity --- */ \
+    "if(s.lockst==0&&s.wipe==0){" \
+    "int dodrop=0;" \
+    "int dlr=held&(B_D|B_L|B_R);" \
+    "if((held&B_D)==0)s.armed=1;" \
+    "if(dlr==B_D&&s.armed==1){" \
+    "if(s.t2==0){s.t2=3;s.sd=min(s.sd+1,255);dodrop=1;}}" \
+    "else s.sd=0;" \
+    "if(dodrop==0){s.grav--;" \
+    "if(s.grav<=0){s.grav=GRAV[min(s.level,20)];dodrop=1;}}" \
+    "else if(false){}" \
+    "if(dodrop==1){" \
+    "if(hit(g,P[s.id*4+s.rot],s.x,s.y+1)){" \
+    /* lock_current_piece: soft-drop points, spawn-lock top-out */ \
+    "if(s.sd>1)s.score=min(s.score+s.sd-1,999999);" \
+    "s.sd=0;s.lockst=1;s.armed=0;" \
+    "if(s.x==2&&s.y==-2){" \
+    "if(s.failed==1){s.mode=1;s.crow=0;return act;}" \
+    "s.failed=1;}" \
+    "}else s.y++;}}" \
+    /* --- check_completed_rows (lockst 2, frame after merge) --- */ \
+    "if(s.lockst==2){" \
+    "int n=countfull(g);" \
+    "s.kind=n;s.lockst=3;s.blink=0;s.t1=2;" \
+    "if(n>0)s.lines=min(s.lines+n,250);}" \
+    /* --- lock_piece_into_bg (lockst 1, same frame as the failed drop) --- */ \
+    "if(s.lockst==1){" \
+    "act|=A_MERGE;lockm=P[s.id*4+s.rot];lx=s.x;ly=s.y;" \
+    "lid=s.id;lrot=s.rot;s.lockst=2;}" \
+    /* --- move_blocks_down --- */ \
+    "if(s.wipe==1&&s.t1==0){act|=A_SHIFT;s.wipe=2;}" \
+    /* --- main-loop timers --- */ \
+    "if(s.t1>0)s.t1--;if(s.t2>0)s.t2--;" \
+    /* --- vblank: animate_line_clear (blink 7x10, then settle 13) --- */ \
+    "if(s.lockst==3&&s.t1==0){" \
+    "if(s.kind==0){s.lockst=0;nextpiece(g,s);}" \
+    "else if(s.blink==6){act|=A_CLEAR;" \
+    "s.blink=0;s.t1=13;s.wipe=1;s.lockst=0;}" \
+    "else{act|=((s.blink&1)==0)?A_GREY:A_RESTORE;" \
+    "s.blink++;s.t1=10;}}" \
+    /* --- vblank: wipe chain (row/frame; score@5, level-up@16) --- */ \
+    "if(s.wipe>=2&&s.t1==0){" \
+    "wiperow=17-(s.wipe-2);act|=A_WIPEROW;" \
+    "if(s.wipe==5&&s.kind>0){" \
+    "int base=s.kind==1?40:s.kind==2?100:s.kind==3?300:1200;" \
+    "s.score=min(s.score+base*(s.level+1),999999);}" \
+    "if(s.wipe==16&&s.level<20&&s.lines/10>s.level)s.level++;" \
+    "s.wipe++;" \
+    "if(s.wipe>19){s.wipe=0;s.kind=0;nextpiece(g,s);}}" \
+    "return act;}\n"
 
 static const char *FS_REG = SIM_COMMON
     "out vec4 O;\n"
     "void main(){"
     "ivec2 p=ivec2(gl_FragCoord.xy);"
-    "ivec2 g=ivec2(p.x/4,p.y);int k=p.x-g.x*4;"
-    "GS s=load(g);int ar;gstep(g,s,ar);"
+    "ivec2 g=ivec2(p.x/5,p.y);int k=p.x-g.x*5;"
+    "GS s=load(g);int wr;uint lm;int lx,ly,lid,lrot;"
+    "gstep(g,s,wr,lm,lx,ly,lid,lrot);"
     "if(k==0)O=vec4(float((s.x+1)|s.rot<<4),float(s.y+2),"
-    "float(s.id|s.prev<<3),float(s.grav))/255.0;"
-    "else if(k==1)O=vec4(float(s.lines),float(s.level|s.stage<<5),"
-    "float(s.cntr|s.nxt<<5),float(s.timer|s.failed<<7))/255.0;"
+    "float(s.id|s.prev<<3|s.armed<<6|s.failed<<7),"
+    "float(s.nxt|s.lockst<<3|s.blink<<5))/255.0;"
+    "else if(k==1)O=vec4(float(s.grav),float(s.das|s.t2<<5),"
+    "float(s.t1),float(s.wipe|s.kind<<5))/255.0;"
     "else if(k==2)O=vec4(float(s.rng&255u),float(s.rng>>8u),"
-    "float((s.tgt+1)|s.drot<<4),0.0)/255.0;"
+    "float((s.tgt+1)|s.drot<<4),float(s.held0))/255.0;"
+    "else if(k==3)O=vec4(float(s.lines),float(s.level|s.mode<<5),"
+    "float(s.sd),float(s.crow))/255.0;"
     "else O=vec4(float(s.score&255),float(s.score>>8&255),"
     "float(s.score>>16&255),0.0)/255.0;}";
 
-static const char *FS_BOARD = SIM_COMMON
+/* logic (shadow/WRAM) board: merge, shift, curtain, reset */
+static const char *FS_SHADOW = SIM_COMMON
     "out vec4 O;\n"
     "void main(){"
     "ivec2 t=ivec2(gl_FragCoord.xy);"
     "ivec2 g=ivec2(t.x/10,t.y/18);"
     "int mr=t.y-g.y*18,mc=t.x-g.x*10;"
-    "GS s=load(g);GS s0=s;int ar;int act=gstep(g,s,ar);"
-    "vec4 self=texelFetch(uBoard,t,0);"
-    "if(act==ACT_NONE){O=self;return;}"
-    "if(act==ACT_CLEAR){O=vec4(0.0);return;}"
-    "if(act==ACT_CURTAIN){O=(mr==ar)?vec4(1.0,23.0/255.0,0.0,1.0):self;"
-    "return;}" /* curtain fills with tile $87 like the original */
-    "if(act==ACT_MERGE){"
-    "uint m=P[s0.id*4+s0.rot];int pr=mr-s0.y,pc=mc-s0.x;"
-    "if(pr>=0&&pr<4&&pc>=0&&pc<4&&pcell(m,pr,pc))"
-    "O=vec4(1.0,float(tileFor(s0.id,s0.rot,pr,pc))/255.0,0.0,1.0);"
-    "else O=self;return;}"
-    /* ACT_REMOVE: drop full rows, walking sources bottom-up */
-    "int d=17;int src=-1;"
-    "for(int r=17;r>=0;r--){"
-    "bool full=true;"
-    "for(int c=0;c<10;c++)if(!bfill(g,r,c)){full=false;break;}"
-    "if(full)continue;"
-    "if(d==mr){src=r;break;}d--;}"
-    "if(src<0){O=vec4(0.0);return;}"
-    "O=texelFetch(uBoard,ivec2(g.x*10+mc,g.y*18+src),0);}";
+    "GS s=load(g);int wr;uint lm;int lx,ly,lid,lrot;"
+    "int act=gstep(g,s,wr,lm,lx,ly,lid,lrot);"
+    "vec4 self=texelFetch(uShadow,t,0);"
+    "if((act&A_RESET)!=0){O=vec4(0.0);return;}"
+    "if((act&A_CURTAIN)!=0){O=(mr==wr)?vec4(1.0,23.0/255.0,0.0,1.0):self;"
+    "return;}"
+    "if((act&A_MERGE)!=0){int pr=mr-ly,pc=mc-lx;"
+    "if(pr>=0&&pr<4&&pc>=0&&pc<4&&pcell(lm,pr,pc))"
+    "{O=vec4(1.0,float(tileFor(lid,lrot,pr,pc))/255.0,0.0,1.0);return;}}"
+    "if((act&A_SHIFT)!=0){O=shifted(g,mr,mc);return;}"
+    "O=self;}";
+
+/* display (VRAM) board: blink grey/restore/clear + progressive wipe redraw,
+ * deferred from the shadow exactly like the original's VRAM writes */
+static const char *FS_DISP = SIM_COMMON
+    "out vec4 O;\n"
+    "void main(){"
+    "ivec2 t=ivec2(gl_FragCoord.xy);"
+    "ivec2 g=ivec2(t.x/10,t.y/18);"
+    "int mr=t.y-g.y*18,mc=t.x-g.x*10;"
+    "GS s=load(g);int wr;uint lm;int lx,ly,lid,lrot;"
+    "int act=gstep(g,s,wr,lm,lx,ly,lid,lrot);"
+    "vec4 self=texelFetch(uDisp,t,0);"
+    "if((act&A_RESET)!=0){O=vec4(0.0);return;}"
+    "if((act&A_CURTAIN)!=0){O=(mr==wr)?vec4(1.0,23.0/255.0,0.0,1.0):self;"
+    "return;}"
+    "if((act&A_MERGE)!=0){int pr=mr-ly,pc=mc-lx;"
+    "if(pr>=0&&pr<4&&pc>=0&&pc<4&&pcell(lm,pr,pc))"
+    "{O=vec4(1.0,float(tileFor(lid,lrot,pr,pc))/255.0,0.0,1.0);return;}}"
+    "bool full=rowfull(g,mr);"
+    "if((act&A_GREY)!=0&&full){O=vec4(1.0,28.0/255.0,0.0,1.0);return;}"
+    "if((act&A_RESTORE)!=0&&full){O=scell(g,mr,mc);return;}"
+    "if((act&A_CLEAR)!=0&&full){O=vec4(0.0);return;}"
+    "if((act&A_WIPEROW)!=0&&mr==wr){"
+    "O=((act&A_SHIFT)!=0)?shifted(g,mr,mc):scell(g,mr,mc);return;}"
+    "O=self;}";
 
 static const char *FS_SHOW =
     "#version 300 es\n"
     "precision highp float; precision highp int;\n"
-    "uniform sampler2D uBoard; uniform sampler2D uReg;"
+    "uniform sampler2D uDisp; uniform sampler2D uReg;"
     "uniform sampler2D uBig; uniform sampler2D uTiles;\n"
     "uniform vec2 uRes; uniform vec2 uCam; uniform float uScale;\n"
     "const uint P[28]=uint[28]("
@@ -294,7 +361,6 @@ static const char *FS_SHOW =
     "0x0F00u,0x2222u,0x0F00u,0x2222u,0x6600u,0x6600u,0x6600u,0x6600u,"
     "0x6300u,0x1320u,0x6300u,0x1320u,0x3600u,0x2310u,0x3600u,0x2310u,"
     "0x2700u,0x2620u,0x0720u,0x2320u);\n"
-    /* atlas: font tiles $00-$26 at 0..38, gameplay $70-$8F at 39..70 */
     "const int GB=39;\n"
     "const int TILE[7]=int[7](20,17,0,19,18,22,21);\n"
     "int tileFor(int id,int rot,int r,int c){"
@@ -302,11 +368,9 @@ static const char *FS_SHOW =
     "return r==0?16:(r==3?25:24);}return TILE[id];}\n"
     "float tilepx(int t,vec2 tv){"
     "return texelFetch(uTiles,ivec2(t*8+int(tv.x*8.0),int(tv.y*8.0)),0).r;}\n"
-    /* labels in font tile ids: SCORE LEVEL LINES */
     "const int LSCORE[5]=int[5](0x1C,0x0C,0x18,0x1B,0x0E);\n"
     "const int LLEVEL[5]=int[5](0x15,0x0E,0x1F,0x0E,0x15);\n"
     "const int LLINES[5]=int[5](0x15,0x12,0x17,0x0E,0x1C);\n"
-    /* digit i of an n-digit right-aligned number, -1 = leading blank */
     "int dig(int v,int i,int n){"
     "int p=1;for(int k=1;k<n-i;k++)p*=10;"
     "if(i<n-1&&v<p)return -1;return (v/p)%10;}\n"
@@ -318,34 +382,29 @@ static const char *FS_SHOW =
     "{O=vec4(0.02,0.02,0.03,1.0);return;}"
     "ivec2 g=ivec2(w);vec2 fr=fract(w);"
     "vec3 big=texelFetch(uBig,g,0).rgb;"
-    /* each game is a 20x18-tile virtual GB screen, like the real layout:
-     * border, wall, 10-wide field, wall, then the SCORE/LEVEL/LINES panel */
     "int vc=int(fr.x*20.0),vr=int(fr.y*18.0);"
     "vec2 tv=vec2(fract(fr.x*20.0),fract(fr.y*18.0));"
-    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*4,g.y),0)*255.0+0.5);"
-    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*4+1,g.y),0)*255.0+0.5);"
-    "ivec4 d=ivec4(texelFetch(uReg,ivec2(g.x*4+3,g.y),0)*255.0+0.5);"
-    "int stage=b.g>>5,phase=b.b&31;"
+    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*5,g.y),0)*255.0+0.5);"
+    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*5+1,g.y),0)*255.0+0.5);"
+    "ivec4 d3=ivec4(texelFetch(uReg,ivec2(g.x*5+3,g.y),0)*255.0+0.5);"
+    "ivec4 e=ivec4(texelFetch(uReg,ivec2(g.x*5+4,g.y),0)*255.0+0.5);"
+    "int lockst=a.a>>3&3,wipe=b.a&31,mode=d3.g>>5;"
     "float grey=1.0;int tile=-1;"
     "if(vc==1||vc==12){tile=GB+11;}"
     "else if(vc==0){grey=0.75;}"
     "else if(vc>=2&&vc<=11){"
     "int mc=vc-2,mr=vr;"
-    "vec4 cell=texelFetch(uBoard,ivec2(g.x*10+mc,g.y*18+mr),0);"
+    "vec4 cell=texelFetch(uDisp,ivec2(g.x*10+mc,g.y*18+mr),0);"
     "if(cell.r>0.5)tile=GB+int(cell.g*255.0+0.5);"
+    /* active piece: hidden while locked/wiping, like the OAM hide */
+    "if(mode==0&&lockst==0&&wipe==0){"
     "int px=(a.r&15)-1,rot=a.r>>4,py=a.g-2,id=a.b&7;"
-    "if(stage==0){int pr=mr-py,pc=mc-px;"
+    "int pr=mr-py,pc=mc-px;"
     "if(pr>=0&&pr<4&&pc>=0&&pc<4&&(P[id*4+rot]>>uint(pr*4+pc)&1u)!=0u)"
     "tile=GB+tileFor(id,rot,pr,pc);}"
-    "if(stage==3&&(phase&1)==0){bool full=true;"
-    "for(int c=0;c<10;c++)"
-    "if(texelFetch(uBoard,ivec2(g.x*10+c,g.y*18+mr),0).r<0.5)"
-    "{full=false;break;}"
-    "if(full)tile=GB+28;}"
     "}else{"
-    /* right panel, coords echoing the real A-type screen */
-    "int score=d.r|d.g<<8|d.b<<16;"
-    "int level=b.g&31,lines=b.r;"
+    "int score=e.r|e.g<<8|e.b<<16;"
+    "int level=d3.g&31,lines=d3.r;"
     "if(vr==1&&vc>=13&&vc<=17)tile=LSCORE[vc-13];"
     "else if(vr==3&&vc>=13&&vc<=18){int t=dig(score,vc-13,6);"
     "if(t>=0)tile=t;}"
@@ -408,14 +467,11 @@ static GLuint make_tex(int w, int h, const void *data)
     return t;
 }
 
-/* grayscale atlas of the REAL tiles, so zooming in shows the same
- * graphics: font $00-$26 (digits + letters, atlas 0..38) followed by
- * gameplay $70-$8F (walls, blocks, flash, curtain, atlas 39..70) */
+/* grayscale atlas: font $00-$26 (0..38) + gameplay $70-$8F (39..70) */
 static void tiles_init(void)
 {
-    /* ts_font / ts_gameplay live in game.c — same translation unit */
     enum { NFONT = 39, NGP = 32, N = NFONT + NGP,
-           GP_FIRST = 0x70, VBASE = 48 /* GAMEPLAY_BASE */ };
+           GP_FIRST = 0x70, VBASE = 48 };
     uint8_t *px = calloc(1, (size_t)N * 8 * 8 * 4);
     for (int t = 0; t < N; t++) {
         const Tile *tile = (t < NFONT)
@@ -424,12 +480,10 @@ static void tiles_init(void)
         for (int y = 0; y < 8; y++) {
             for (int x = 0; x < 8; x++) {
                 uint32_t c = tile->px[y * 8 + x];
-                /* luminance works for both palette-mapped GB tiles and
-                 * full-color custom tilesets (whose alpha carries no shade) */
                 uint32_t r = c & 0xFF, gg = c >> 8 & 0xFF, b = c >> 16 & 0xFF;
                 uint8_t grey = (c >> 24)
                     ? (uint8_t)((r * 77 + gg * 150 + b * 29) >> 8)
-                    : 255; /* transparent = shade 0 = lightest */
+                    : 255;
                 size_t o = ((size_t)y * N * 8 + (size_t)t * 8 + x) * 4;
                 px[o] = px[o + 1] = px[o + 2] = grey;
                 px[o + 3] = 255;
@@ -442,42 +496,33 @@ static void tiles_init(void)
 
 static void sim_init(void)
 {
-    /* every game starts ON THE BOARD: fresh piece pipeline, random start
-     * level 0-9, empty field (like picking a level and pressing start) */
-    uint8_t *rg = calloc(1, (size_t)GAMES_X * REG_TEXELS * GAMES_Y * 4);
     static const int grav[21] = { 52,48,44,40,36,32,27,21,16,10,9,8,7,6,5,
                                   5,4,4,3,3,2 };
+    uint8_t *rg = calloc(1, (size_t)GAMES_X * REG_TEXELS * GAMES_Y * 4);
     for (int gy = 0; gy < GAMES_Y; gy++) {
         for (int gx = 0; gx < GAMES_X; gx++) {
             size_t o = ((size_t)gy * GAMES_X * REG_TEXELS
                         + (size_t)gx * REG_TEXELS) * 4;
             int level = rand() % 10;
-            int id = rand() % 7, prev = rand() % 7, nxt = rand() % 7;
-            rg[o + 0] = (uint8_t)((2 + 1) | 0 << 4);   /* x=2 rot=0 */
-            rg[o + 1] = (uint8_t)(-2 + 2);             /* y=-2 */
-            rg[o + 2] = (uint8_t)(id | prev << 3);
-            rg[o + 3] = (uint8_t)(1 + rand() % grav[level]); /* stagger */
-            rg[o + 4] = 0;                             /* lines */
-            rg[o + 5] = (uint8_t)level;                /* stage 0 */
-            rg[o + 6] = (uint8_t)(0 | nxt << 5);
-            rg[o + 7] = 0;
-            unsigned seed = (unsigned)(rand() & 0xFFFF) | 1u;
-            rg[o + 8] = (uint8_t)(seed & 255);
-            rg[o + 9] = (uint8_t)(seed >> 8);
+            rg[o + 0] = (uint8_t)(2 + 1);           /* x=2 rot=0 */
+            rg[o + 1] = (uint8_t)(-2 + 2);          /* y=-2 */
+            rg[o + 2] = (uint8_t)(rand() % 7 | (rand() % 7) << 3 | 1 << 6);
+            rg[o + 3] = (uint8_t)(rand() % 7);      /* nxt, lock=0 */
+            rg[o + 4] = (uint8_t)(1 + rand() % grav[level]);
+            rg[o + 8] = (uint8_t)(rand() & 255);    /* rng lo */
+            rg[o + 9] = (uint8_t)(rand() & 255);    /* rng hi */
             rg[o + 10] = (uint8_t)((rand() % 9 + 1) | (rand() & 3) << 4);
-            rg[o + 11] = 0;
+            rg[o + 12] = 0;                         /* lines */
+            rg[o + 13] = (uint8_t)level;            /* level, mode 0 */
         }
     }
-    tex_board[0] = make_tex(GAMES_X * MB_W, GAMES_Y * MB_H, NULL);
-    {   /* explicit zero board */
-        size_t bn = (size_t)GAMES_X * MB_W * GAMES_Y * MB_H * 4;
-        uint8_t *bd = calloc(1, bn);
-        glBindTexture(GL_TEXTURE_2D, tex_board[0]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GAMES_X * MB_W,
-                        GAMES_Y * MB_H, GL_RGBA, GL_UNSIGNED_BYTE, bd);
-        free(bd);
+    size_t bn = (size_t)GAMES_X * MB_W * GAMES_Y * MB_H * 4;
+    uint8_t *zero = calloc(1, bn);
+    for (int i = 0; i < 2; i++) {
+        tex_shadow[i] = make_tex(GAMES_X * MB_W, GAMES_Y * MB_H, zero);
+        tex_disp[i] = make_tex(GAMES_X * MB_W, GAMES_Y * MB_H, zero);
     }
-    tex_board[1] = make_tex(GAMES_X * MB_W, GAMES_Y * MB_H, NULL);
+    free(zero);
     tex_reg[0] = make_tex(GAMES_X * REG_TEXELS, GAMES_Y, rg);
     tex_reg[1] = make_tex(GAMES_X * REG_TEXELS, GAMES_Y, NULL);
     free(rg);
@@ -486,11 +531,14 @@ static void sim_init(void)
 static void bind_sim_inputs(GLuint prog, int pass)
 {
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_board[cur]);
+    glBindTexture(GL_TEXTURE_2D, tex_shadow[cur]);
     glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_disp[cur]);
+    glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_reg[cur]);
-    glUniform1i(glGetUniformLocation(prog, "uBoard"), 0);
-    glUniform1i(glGetUniformLocation(prog, "uReg"), 1);
+    glUniform1i(glGetUniformLocation(prog, "uShadow"), 0);
+    glUniform1i(glGetUniformLocation(prog, "uDisp"), 1);
+    glUniform1i(glGetUniformLocation(prog, "uReg"), 2);
     glUniform1i(glGetUniformLocation(prog, "uFrame"), frame_no);
     glUniform1i(glGetUniformLocation(prog, "uPass"), pass);
 }
@@ -506,11 +554,18 @@ static void sim_tick(void)
     bind_sim_inputs(prog_reg, 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    glUseProgram(prog_board);
+    glUseProgram(prog_shadow);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, tex_board[cur ^ 1], 0);
+                           GL_TEXTURE_2D, tex_shadow[cur ^ 1], 0);
     glViewport(0, 0, GAMES_X * MB_W, GAMES_Y * MB_H);
-    bind_sim_inputs(prog_board, 1);
+    bind_sim_inputs(prog_shadow, 1);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glUseProgram(prog_disp);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex_disp[cur ^ 1], 0);
+    glViewport(0, 0, GAMES_X * MB_W, GAMES_Y * MB_H);
+    bind_sim_inputs(prog_disp, 2);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -523,14 +578,14 @@ static void draw(void)
     glViewport(0, 0, win_w, win_h);
     glUseProgram(prog_show);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_board[cur]);
+    glBindTexture(GL_TEXTURE_2D, tex_disp[cur]);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_reg[cur]);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_big);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, tex_tiles);
-    glUniform1i(glGetUniformLocation(prog_show, "uBoard"), 0);
+    glUniform1i(glGetUniformLocation(prog_show, "uDisp"), 0);
     glUniform1i(glGetUniformLocation(prog_show, "uReg"), 1);
     glUniform1i(glGetUniformLocation(prog_show, "uBig"), 2);
     glUniform1i(glGetUniformLocation(prog_show, "uTiles"), 3);
@@ -591,7 +646,6 @@ static void frame(void)
         input_handle_event(&ev);
     }
 
-    /* keyboard zoom: =/+ in, - out, Home resets (smooth while held) */
     {
         const Uint8 *k = SDL_GetKeyboardState(NULL);
         double f = 1.0;
@@ -608,7 +662,6 @@ static void frame(void)
             fit_view();
     }
 
-    /* big game: fixed 59.73Hz steps */
     Uint64 now = SDL_GetPerformanceCounter();
     if (last_counter)
         sim_accum += (double)(now - last_counter) /
@@ -621,6 +674,8 @@ static void frame(void)
     while (sim_accum >= step) {
         game_update(input_poll());
         sim_accum -= step;
+        /* micro-games step at the same fixed 59.73Hz as the big game */
+        sim_tick();
         ticked = 1;
     }
     if (ticked || frame_no == 0) {
@@ -630,7 +685,6 @@ static void frame(void)
                         GL_UNSIGNED_BYTE, fb);
     }
 
-    sim_tick();
     draw();
     SDL_GL_SwapWindow(win);
 }
@@ -673,7 +727,8 @@ int main(int argc, char **argv)
     glGenFramebuffers(1, &fbo);
 
     prog_reg = link2(FS_REG);
-    prog_board = link2(FS_BOARD);
+    prog_shadow = link2(FS_SHADOW);
+    prog_disp = link2(FS_DISP);
     prog_show = link2(FS_SHOW);
 
     game_seed((unsigned)SDL_GetPerformanceCounter());
@@ -685,7 +740,6 @@ int main(int argc, char **argv)
     tiles_init();
     sim_init();
 
-    /* FRACTAL_FRAMES + FRACTAL_SHOT (+FRACTAL_ZOOM/CX/CY): headless test */
     const char *shot = getenv("FRACTAL_SHOT");
     if (shot) {
         int n = 120;
@@ -707,7 +761,6 @@ int main(int argc, char **argv)
             sim_tick();
         }
 
-        /* FRACTAL_DUMP="gx,gy": print that game's board+regs as ASCII */
         const char *dump = getenv("FRACTAL_DUMP");
         if (dump) {
             int gx = 0, gy = 0;
@@ -715,7 +768,7 @@ int main(int argc, char **argv)
             uint8_t bpx[MB_W * MB_H * 4], rpx[REG_TEXELS * 4];
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                   GL_TEXTURE_2D, tex_board[cur], 0);
+                                   GL_TEXTURE_2D, tex_shadow[cur], 0);
             glReadPixels(gx * MB_W, gy * MB_H, MB_W, MB_H, GL_RGBA,
                          GL_UNSIGNED_BYTE, bpx);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -723,14 +776,17 @@ int main(int argc, char **argv)
             glReadPixels(gx * REG_TEXELS, gy, REG_TEXELS, 1, GL_RGBA,
                          GL_UNSIGNED_BYTE, rpx);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            printf("x=%d rot=%d y=%d id=%d prev=%d grav=%d | lines=%d "
-                   "level=%d stage=%d cntr=%d nxt=%d timer=%d failed=%d "
-                   "score=%d\n",
+            printf("x=%d rot=%d y=%d id=%d prev=%d armed=%d failed=%d "
+                   "nxt=%d lock=%d blink=%d | grav=%d das=%d t2=%d t1=%d "
+                   "wipe=%d kind=%d | lines=%d level=%d mode=%d sd=%d "
+                   "| score=%d\n",
                    (rpx[0] & 15) - 1, rpx[0] >> 4, rpx[1] - 2,
-                   rpx[2] & 7, rpx[2] >> 3, rpx[3],
-                   rpx[4], rpx[5] & 31, rpx[5] >> 5,
-                   rpx[6] & 31, rpx[6] >> 5, rpx[7] & 127, rpx[7] >> 7,
-                   rpx[12] | rpx[13] << 8 | rpx[14] << 16);
+                   rpx[2] & 7, rpx[2] >> 3 & 7, rpx[2] >> 6 & 1, rpx[2] >> 7,
+                   rpx[3] & 7, rpx[3] >> 3 & 3, rpx[3] >> 5,
+                   rpx[4], rpx[5] & 31, rpx[5] >> 5, rpx[6],
+                   rpx[7] & 31, rpx[7] >> 5,
+                   rpx[12], rpx[13] & 31, rpx[13] >> 5, rpx[14],
+                   rpx[16] | rpx[17] << 8 | rpx[18] << 16);
             for (int r = 0; r < MB_H; r++) {
                 for (int c = 0; c < MB_W; c++)
                     putchar(bpx[(r * MB_W + c) * 4] > 127 ? '#' : '.');
