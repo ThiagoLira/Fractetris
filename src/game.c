@@ -735,6 +735,31 @@ int game_init(void)
     return 0;
 }
 
+int game_reload_tiles(void)
+{
+    Tileset nf, nt, ng;
+    if (assets_load_tileset("font", &nf) ||
+        assets_load_tileset("copyrightandtitlescreen", &nt) ||
+        assets_load_tileset("configandgameplay", &ng))
+        return -1;
+    tileset_free(&ts_font);
+    tileset_free(&ts_title);
+    tileset_free(&ts_gameplay);
+    ts_font = nf;
+    ts_title = nt;
+    ts_gameplay = ng;
+
+    video_load_tiles(ts_font.tiles, ts_font.count, FONT_BASE);
+    if (state == ST_TITLE) {
+        video_load_tiles(ts_title.tiles, ts_title.count, TITLE_BASE);
+    } else {
+        video_load_tiles(ts_title.tiles, 10, TITLE_BASE);
+        video_load_tiles(ts_gameplay.tiles, ts_gameplay.count,
+                         GAMEPLAY_BASE);
+    }
+    return 0;
+}
+
 void game_update(Input in)
 {
     switch (state) {

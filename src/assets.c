@@ -10,6 +10,7 @@
 #include "assets.h"
 
 static char asset_root[512] = "assets";
+static char override_dir[128] = "custom";
 
 /* 0xRRGGBB -> internal layout (R in low byte, matches ABGR8888 textures) */
 static uint32_t rgb(uint32_t c)
@@ -67,16 +68,29 @@ static uint8_t *read_file(const char *path, long *size)
     return buf;
 }
 
-/* custom/<subpath> wins over <subpath> */
+/* <override>/<subpath> wins over <subpath>; default override is custom/ */
 static uint8_t *read_asset(const char *subpath, long *size)
 {
     char path[1024];
-    snprintf(path, sizeof path, "%s/custom/%s", asset_root, subpath);
-    uint8_t *buf = read_file(path, size);
-    if (buf)
-        return buf;
+    if (override_dir[0]) {
+        snprintf(path, sizeof path, "%s/%s/%s", asset_root, override_dir,
+                 subpath);
+        uint8_t *buf = read_file(path, size);
+        if (buf)
+            return buf;
+    }
     snprintf(path, sizeof path, "%s/%s", asset_root, subpath);
     return read_file(path, size);
+}
+
+void assets_set_override(const char *dir)
+{
+    snprintf(override_dir, sizeof override_dir, "%s", dir ? dir : "");
+}
+
+const char *assets_root(void)
+{
+    return asset_root;
 }
 
 int assets_load_tileset(const char *name, Tileset *out)

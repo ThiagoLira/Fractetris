@@ -33,6 +33,7 @@
 
 #include <SDL.h>
 #include <GLES3/gl3.h>
+#include <dirent.h>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -514,8 +515,117 @@ static void tiles_init(void)
             }
         }
     }
-    tex_tiles = make_tex(N * 8, 8, px);
+    if (tex_tiles) {
+        glBindTexture(GL_TEXTURE_2D, tex_tiles);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, N * 8, 8, GL_RGBA,
+                        GL_UNSIGNED_BYTE, px);
+    } else {
+        tex_tiles = make_tex(N * 8, 8, px);
+    }
     free(px);
+}
+
+static void tiles_refresh(void) { tiles_init(); }
+
+/* ---- skin packs: assets/packs/<name>/ switched live with T ---- */
+static char packs[8][96];
+static int npacks, curpack;
+
+static void packs_scan(void)
+{
+    snprintf(packs[0], sizeof packs[0], "custom");
+    npacks = 1;
+    char dirpath[600];
+    snprintf(dirpath, sizeof dirpath, "%s/packs", assets_root());
+    DIR *d = opendir(dirpath);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) && npacks < 8) {
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(packs[npacks], sizeof packs[0], "packs/%s", e->d_name);
+        npacks++;
+    }
+    closedir(d);
+}
+
+/* recompose the three boot screens from tilemaps + current tilesets,
+ * WITHOUT driving the live game through its menu states */
+static void menus_compose(uint8_t *buf)
+{
+    static const Tilemap *maps[3];
+    maps[0] = &tm_title;
+    maps[1] = &tm_modeselect;
+    maps[2] = &tm_adiff;
+    for (int m = 0; m < 3; m++) {
+        uint32_t *out = (uint32_t *)buf + (size_t)m * GB_W * GB_H;
+        for (int ty = 0; ty < 18; ty++) {
+            for (int tx = 0; tx < 20; tx++) {
+                int id = maps[m]->data[ty * 20 + tx];
+                const Tile *t = NULL;
+                if (id < 39 && id < ts_font.count)
+                    t = &ts_font.tiles[id];
+                else if (m == 0 && id >= 39 && id - 39 < ts_title.count)
+                    t = &ts_title.tiles[id - 39];
+                else if (m > 0 && id >= 39 && id < 48 &&
+                         id - 39 < ts_title.count)
+                    t = &ts_title.tiles[id - 39];
+                else if (m > 0 && id >= 48 && id - 48 < ts_gameplay.count)
+                    t = &ts_gameplay.tiles[id - 48];
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++) {
+                        uint32_t c = t ? t->px[y * 8 + x] : 0;
+                        if (!(c >> 24))
+                            c = assets_palette_color(0);
+                        out[(ty * 8 + y) * GB_W + tx * 8 + x] =
+                            c | 0xFF000000u;
+                    }
+            }
+        }
+    }
+    /* the title's 1P cursor sprite (tile $58 = title idx 49) */
+    if (ts_title.count > 49) {
+        uint32_t *out = (uint32_t *)buf;
+        const Tile *t = &ts_title.tiles[49];
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++) {
+                uint32_t c = t->px[y * 8 + x];
+                if (c >> 24)
+                    out[(112 + y) * GB_W + 8 + x] = c | 0xFF000000u;
+            }
+    }
+}
+
+static void menus_refresh(void)
+{
+    static uint8_t buf[(size_t)GB_W * GB_H * 3 * 4];
+    menus_compose(buf);
+    glBindTexture(GL_TEXTURE_2D, tex_menus);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GB_W, GB_H * 3, GL_RGBA,
+                    GL_UNSIGNED_BYTE, buf);
+}
+
+static void tiles_refresh(void);
+
+/* live skin switch: reload tilesets, refresh video bank, atlas, menus */
+static void pack_cycle(void)
+{
+    if (npacks < 1)
+        return;
+    curpack = (curpack + 1) % npacks;
+    assets_set_override(packs[curpack]);
+    if (game_reload_tiles() != 0) { /* pack unreadable: fall back */
+        assets_set_override("custom");
+        curpack = 0;
+        game_reload_tiles();
+    }
+    tiles_refresh();
+    menus_refresh();
+    video_render(fb);
+    glBindTexture(GL_TEXTURE_2D, tex_big);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GB_W, GB_H, GL_RGBA,
+                    GL_UNSIGNED_BYTE, fb);
 }
 
 /* pre-render the three boot screens with the actual C engine so the
@@ -672,6 +782,8 @@ static void frame(void)
         case SDL_KEYDOWN:
             if (ev.key.keysym.sym == SDLK_ESCAPE)
                 running = 0;
+            if (ev.key.keysym.sym == SDLK_t)
+                pack_cycle();
             break;
         case SDL_MOUSEWHEEL: {
             int mx, my;
@@ -798,6 +910,13 @@ int main(int argc, char **argv)
     tiles_init();
     menus_init();
     sim_init();
+    packs_scan();
+
+    if (getenv("FRACTAL_PACK")) { /* headless testing hook */
+        int target = atoi(getenv("FRACTAL_PACK"));
+        for (int i = 0; i < target && i < 8; i++)
+            pack_cycle();
+    }
 
     const char *shot = getenv("FRACTAL_SHOT");
     if (shot) {

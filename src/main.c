@@ -5,6 +5,7 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
+#include <dirent.h>
 
 #include "assets.h"
 #include "game.h"
@@ -26,6 +27,40 @@ static int running = 1;
 static double sim_accum;
 static Uint64 last_counter;
 
+/* skin packs under assets/packs/, cycled live with T */
+static char packs[8][96];
+static int npacks, curpack;
+
+static void packs_scan(void)
+{
+    snprintf(packs[0], sizeof packs[0], "custom");
+    npacks = 1;
+    char dirpath[600];
+    snprintf(dirpath, sizeof dirpath, "%s/packs", assets_root());
+    DIR *d = opendir(dirpath);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) && npacks < 8) {
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(packs[npacks], sizeof packs[0], "packs/%s", e->d_name);
+        npacks++;
+    }
+    closedir(d);
+}
+
+static void pack_cycle(void)
+{
+    curpack = (curpack + 1) % (npacks ? npacks : 1);
+    assets_set_override(packs[curpack]);
+    if (game_reload_tiles() != 0) {
+        assets_set_override("custom");
+        curpack = 0;
+        game_reload_tiles();
+    }
+}
+
 static void frame(void)
 {
     SDL_Event ev;
@@ -33,6 +68,8 @@ static void frame(void)
         if (ev.type == SDL_QUIT ||
             (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE))
             running = 0;
+        if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_t)
+            pack_cycle();
         input_handle_event(&ev);
     }
 
@@ -91,6 +128,7 @@ int main(int argc, char **argv)
     game_seed((unsigned)SDL_GetPerformanceCounter());
     if (game_init())
         return 1;
+    packs_scan();
 
     /* TETRIS_SCRIPT="60x,1xS,30x" — comma list of <frames>x<buttons>
      * (S=start E=select A B L R U D); runs headless, then TETRIS_SHOT. */
