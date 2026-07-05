@@ -523,7 +523,7 @@ static void tiles_init(void)
 static void menus_init(void)
 {
     uint8_t *buf = malloc((size_t)GB_W * GB_H * 3 * 4);
-    uint32_t tmp[GB_W * GB_H];
+    static uint32_t tmp[GB_W * GB_H]; /* static: exceeds the wasm stack */
     Input none = { 0, 0 };
 
     enter_title();
