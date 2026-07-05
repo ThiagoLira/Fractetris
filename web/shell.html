@@ -96,9 +96,9 @@
     setStatus: function (t) { statusEl.textContent = t; },
     onRuntimeInitialized: function () {
       statusEl.textContent = '';
-      // the fractal build titles its SDL window "Fractal Tetris"
+      // the classic build titles its SDL window "... (classic)"
       setTimeout(function () {
-        var isFractal = document.title.indexOf('Fractal') !== -1;
+        var isFractal = document.title.indexOf('classic') === -1;
         document.getElementById('zoomhelp').hidden = !isFractal;
         if (!isFractal)
           document.querySelectorAll('.zoomer').forEach(function (b) {

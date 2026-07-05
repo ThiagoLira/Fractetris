@@ -78,7 +78,7 @@ int main(int argc, char **argv)
     }
     input_init();
 
-    window = SDL_CreateWindow("Fractetris",
+    window = SDL_CreateWindow("Fractetris (classic)",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         GB_W * WINDOW_SCALE, GB_H * WINDOW_SCALE, SDL_WINDOW_RESIZABLE);
     renderer = SDL_CreateRenderer(window, -1,
