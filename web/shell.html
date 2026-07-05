@@ -104,9 +104,24 @@
           document.querySelectorAll('.zoomer').forEach(function (b) {
             b.classList.add('ghost');
           });
+        snapCanvas();
       }, 100);
     }
   };
+
+
+  /* classic build: snap the canvas to integer pixel multiples so the
+     160x144 grid stays crisp like a real LCD */
+  function snapCanvas() {
+    if (document.title.indexOf('classic') === -1) return;
+    var c = document.getElementById('canvas');
+    var k = Math.max(1, Math.floor(Math.min(
+      window.innerWidth * 0.92 / 160, window.innerHeight * 0.82 / 144)));
+    c.style.width = (160 * k) + 'px';
+    c.style.height = (144 * k) + 'px';
+    c.style.aspectRatio = 'auto';
+  }
+  window.addEventListener('resize', snapCanvas);
 
   /* touch buttons -> synthetic key events; press-and-hold works because
      SDL tracks key state until the matching keyup */
