@@ -53,7 +53,7 @@ static int running = 1;
 static uint32_t fb[GB_W * GB_H];
 
 static GLuint prog_reg, prog_shadow, prog_disp, prog_show;
-static GLuint tex_big, tex_tiles;
+static GLuint tex_big, tex_tiles, tex_menus;
 static GLuint tex_reg[2], tex_shadow[2], tex_disp[2];
 static GLuint fbo;
 static GLuint vao;
@@ -87,7 +87,8 @@ static const char *VS =
  *     A=nxt|lock<<3|blink<<5
  * T1: R=gravtimer  G=das|t2<<5  B=timer1  A=wipe|kind<<5
  * T2: R,G=rng  B=(tgt+1)|drot<<4  A=prev held buttons
- * T3: R=lines  G=level|mode<<5 (mode 0 play, 1 curtain, 2 over)
+ * T3: R=lines  G=level|mode<<5 (0 play, 1 curtain, 2 over,
+ *        3 title, 4 mode-select, 5 level-select)
  *     B=softdrop count  A=curtain row
  * T4: R,G,B=score
  *
@@ -213,13 +214,23 @@ static const char *VS =
     "if(s.crow>=18){s.mode=2;s.t1=70;}" \
     "return A_CURTAIN;}" \
     "if(s.mode==2){if(s.t1>0){s.t1--;return 0;}" \
+    /* back to the title screen (board cleared under the menus) */ \
+    "s.mode=3;s.t1=40+int(hsh(gid^uint(uFrame))%80u);" \
+    "return A_RESET;}" \
+    /* --- boot flow: title -> mode select -> level select -> play. \
+     * The virtual player presses Start on defaults: 1P, A-type, level 0 */ \
+    "if(s.mode==3){if(s.t1>0){s.t1--;return 0;}" \
+    "s.mode=4;s.t1=20+int(hsh(gid^uint(uFrame)^7u)%25u);return 0;}" \
+    "if(s.mode==4){if(s.t1>0){s.t1--;return 0;}" \
+    "s.mode=5;s.t1=20+int(hsh(gid^uint(uFrame)^13u)%25u);return 0;}" \
+    "if(s.mode==5){if(s.t1>0){s.t1--;return 0;}" \
     "s.rng=(hsh(gid^uint(uFrame))&0xFFFFu)|1u;" \
-    "s.lines=0;s.failed=0;s.score=0;s.mode=0;s.crow=0;" \
-    "s.level=int(hsh(gid^uint(uFrame)^0xBEEFu)%10u);" \
+    "s.lines=0;s.failed=0;s.score=0;s.crow=0;" \
+    "s.level=0;" /* default settings: first level */ \
     "s.lockst=0;s.blink=0;s.wipe=0;s.kind=0;s.t1=0;s.t2=0;s.das=0;" \
     "s.prev=rndpiece(s.rng);s.nxt=rndpiece(s.rng);" \
-    "nextpiece(g,s);" \
-    "return A_RESET;}" \
+    "nextpiece(g,s);s.mode=0;" \
+    "return 0;}" \
     /* --- rotate_and_shift: rotation + DAS, real timings --- */ \
     "if(s.lockst==0&&s.wipe==0){" \
     "int old=s.rot;" \
@@ -354,8 +365,10 @@ static const char *FS_SHOW =
     "#version 300 es\n"
     "precision highp float; precision highp int;\n"
     "uniform sampler2D uDisp; uniform sampler2D uReg;"
-    "uniform sampler2D uBig; uniform sampler2D uTiles;\n"
-    "uniform vec2 uRes; uniform vec2 uCam; uniform float uScale;\n"
+    "uniform sampler2D uBig; uniform sampler2D uTiles;"
+    "uniform sampler2D uMenus;\n"
+    "uniform vec2 uRes; uniform vec2 uCam; uniform float uScale;"
+    "uniform int uFrame;\n"
     "const uint P[28]=uint[28]("
     "0x1700u,0x6220u,0x0740u,0x2230u,0x4700u,0x2260u,0x0710u,0x3220u,"
     "0x0F00u,0x2222u,0x0F00u,0x2222u,0x6600u,0x6600u,0x6600u,0x6600u,"
@@ -389,6 +402,17 @@ static const char *FS_SHOW =
     "ivec4 d3=ivec4(texelFetch(uReg,ivec2(g.x*5+3,g.y),0)*255.0+0.5);"
     "ivec4 e=ivec4(texelFetch(uReg,ivec2(g.x*5+4,g.y),0)*255.0+0.5);"
     "int lockst=a.a>>3&3,wipe=b.a&31,mode=d3.g>>5;"
+    /* booting games show the real menu screens (pre-rendered by the C
+     * engine), with the blinking selection overlaid by the shader */
+    "if(mode>=3){"
+    "ivec2 sp=ivec2(int(fr.x*160.0),int(fr.y*144.0)+(mode-3)*144);"
+    "vec3 mpx=texelFetch(uMenus,sp,0).rgb;"
+    "float lum=dot(mpx,vec3(0.30,0.59,0.11));"
+    "bool blink=((uFrame>>4)&1)==0;"
+    "int mvc=int(fr.x*20.0),mvr=int(fr.y*18.0);"
+    "if(mode==4&&blink&&mvr==5&&mvc>=3&&mvc<=8)lum=1.0-lum;"
+    "if(mode==5&&blink&&mvr==6&&mvc==5)lum=1.0-lum;"
+    "O=vec4(big*lum,1.0);return;}"
     "float grey=1.0;int tile=-1;"
     "if(vc==1||vc==12){tile=GB+11;}"
     "else if(vc==0){grey=0.75;}"
@@ -494,6 +518,35 @@ static void tiles_init(void)
     free(px);
 }
 
+/* pre-render the three boot screens with the actual C engine so the
+ * micro-games' menus are pixel-identical to the big game's */
+static void menus_init(void)
+{
+    uint8_t *buf = malloc((size_t)GB_W * GB_H * 3 * 4);
+    uint32_t tmp[GB_W * GB_H];
+    Input none = { 0, 0 };
+
+    enter_title();
+    game_update(none);
+    video_render(tmp);
+    memcpy(buf, tmp, sizeof tmp);
+
+    load_menu_screen(&tm_modeselect, ST_MODE_SELECT);
+    game_update(none);
+    video_render(tmp);
+    memcpy(buf + sizeof tmp, tmp, sizeof tmp);
+
+    menu_cursor = 0;
+    load_menu_screen(&tm_adiff, ST_A_LEVEL);
+    game_update(none);
+    video_render(tmp);
+    memcpy(buf + 2 * sizeof tmp, tmp, sizeof tmp);
+
+    tex_menus = make_tex(GB_W, GB_H * 3, buf);
+    free(buf);
+    enter_title(); /* reset the big game to its own boot state */
+}
+
 static void sim_init(void)
 {
     static const int grav[21] = { 52,48,44,40,36,32,27,21,16,10,9,8,7,6,5,
@@ -503,17 +556,18 @@ static void sim_init(void)
         for (int gx = 0; gx < GAMES_X; gx++) {
             size_t o = ((size_t)gy * GAMES_X * REG_TEXELS
                         + (size_t)gx * REG_TEXELS) * 4;
-            int level = rand() % 10;
+            (void)grav;
             rg[o + 0] = (uint8_t)(2 + 1);           /* x=2 rot=0 */
             rg[o + 1] = (uint8_t)(-2 + 2);          /* y=-2 */
             rg[o + 2] = (uint8_t)(rand() % 7 | (rand() % 7) << 3 | 1 << 6);
             rg[o + 3] = (uint8_t)(rand() % 7);      /* nxt, lock=0 */
-            rg[o + 4] = (uint8_t)(1 + rand() % grav[level]);
+            rg[o + 4] = 1;
+            rg[o + 6] = (uint8_t)(1 + rand() % 120); /* t1: boot stagger */
             rg[o + 8] = (uint8_t)(rand() & 255);    /* rng lo */
             rg[o + 9] = (uint8_t)(rand() & 255);    /* rng hi */
             rg[o + 10] = (uint8_t)((rand() % 9 + 1) | (rand() & 3) << 4);
             rg[o + 12] = 0;                         /* lines */
-            rg[o + 13] = (uint8_t)level;            /* level, mode 0 */
+            rg[o + 13] = (uint8_t)(0 | 3 << 5);     /* level 0, mode 3 */
         }
     }
     size_t bn = (size_t)GAMES_X * MB_W * GAMES_Y * MB_H * 4;
@@ -585,10 +639,14 @@ static void draw(void)
     glBindTexture(GL_TEXTURE_2D, tex_big);
     glActiveTexture(GL_TEXTURE3);
     glBindTexture(GL_TEXTURE_2D, tex_tiles);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, tex_menus);
     glUniform1i(glGetUniformLocation(prog_show, "uDisp"), 0);
     glUniform1i(glGetUniformLocation(prog_show, "uReg"), 1);
     glUniform1i(glGetUniformLocation(prog_show, "uBig"), 2);
     glUniform1i(glGetUniformLocation(prog_show, "uTiles"), 3);
+    glUniform1i(glGetUniformLocation(prog_show, "uMenus"), 4);
+    glUniform1i(glGetUniformLocation(prog_show, "uFrame"), frame_no);
     glUniform2f(glGetUniformLocation(prog_show, "uRes"),
                 (float)win_w, (float)win_h);
     glUniform2f(glGetUniformLocation(prog_show, "uCam"),
@@ -738,6 +796,7 @@ int main(int argc, char **argv)
     video_render(fb);
     tex_big = make_tex(GB_W, GB_H, fb);
     tiles_init();
+    menus_init();
     sim_init();
 
     const char *shot = getenv("FRACTAL_SHOT");
