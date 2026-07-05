@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tetris (Game Boy PC port)</title>
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #0f120e; color: #cdd6c8;
+    font-family: system-ui, sans-serif;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+  }
+  canvas {
+    image-rendering: pixelated;
+    width: min(90vw, calc(85vh * 160 / 144));
+    aspect-ratio: 160 / 144;
+    border: 2px solid #2a2f28; border-radius: 4px;
+    background: #000;
+  }
+  #status { font-size: 13px; opacity: .7; min-height: 1em; }
+  #controls {
+    font-size: 13px; line-height: 1.6; text-align: center;
+    color: #9fb097; max-width: 90vw;
+  }
+  #controls b { color: #cdd6c8; font-weight: 600; }
+
+  /* ---- touch controls (mobile only) ---- */
+  #touch { display: none; }
+  @media (pointer: coarse) {
+    #controls { display: none; }
+    #touch { display: block; }
+    body { justify-content: flex-start; padding-top: 8px; }
+    canvas { width: 98vw; }
+    .tpad {
+      position: fixed; bottom: 12px; z-index: 10;
+      display: grid; gap: 6px; touch-action: none;
+    }
+    #tleft { left: 10px; grid-template-columns: repeat(3, 52px); }
+    #tright { right: 10px; grid-template-columns: repeat(2, 58px); }
+    #tmid {
+      left: 50%; transform: translateX(-50%);
+      grid-template-columns: 88px; /* stacked: fits between the pads */
+    }
+    .tbtn {
+      background: #1d231b; color: #cdd6c8;
+      border: 1px solid #3a4437; border-radius: 10px;
+      font: 600 18px system-ui, sans-serif;
+      height: 52px; opacity: .82;
+      display: flex; align-items: center; justify-content: center;
+      -webkit-user-select: none; user-select: none; touch-action: none;
+    }
+    .tbtn:active { background: #3a4437; }
+    .tbtn.round { border-radius: 50%; height: 58px; font-size: 22px; }
+    .tbtn.pill { height: 34px; font-size: 12px; letter-spacing: 1px; }
+    .tbtn.ghost { visibility: hidden; }
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<div id="status">loading…</div>
+<div id="controls">
+  <b>&larr;&darr;&rarr;</b> move &middot; <b>Z</b>/<b>X</b> rotate &middot;
+  <b>Enter</b> start/pause &middot; <b>Tab</b> hide preview
+  <span id="zoomhelp" hidden><br>
+  <b>scroll</b> or <b>=</b>/<b>-</b> zoom &middot; <b>drag</b> pan &middot;
+  <b>Home</b> fit view &mdash; every pixel is its own game of Tetris, zoom in!
+  </span>
+</div>
+<div id="touch">
+  <div class="tpad" id="tleft">
+    <div class="tbtn ghost"></div>
+    <div class="tbtn" data-k="ArrowUp,38">&uarr;</div>
+    <div class="tbtn ghost"></div>
+    <div class="tbtn" data-k="ArrowLeft,37">&larr;</div>
+    <div class="tbtn" data-k="ArrowDown,40">&darr;</div>
+    <div class="tbtn" data-k="ArrowRight,39">&rarr;</div>
+  </div>
+  <div class="tpad" id="tright">
+    <div class="tbtn zoomer" data-k="Minus,189">&minus;</div>
+    <div class="tbtn zoomer" data-k="Equal,187">+</div>
+    <div class="tbtn round" data-k="KeyZ,90">B</div>
+    <div class="tbtn round" data-k="KeyX,88">A</div>
+  </div>
+  <div class="tpad" id="tmid">
+    <div class="tbtn pill" data-k="Enter,13">START</div>
+    <div class="tbtn pill" data-k="Tab,9">SELECT</div>
+  </div>
+</div>
+<script>
+  var statusEl = document.getElementById('status');
+  var Module = {
+    canvas: document.getElementById('canvas'),
+    setStatus: function (t) { statusEl.textContent = t; },
+    onRuntimeInitialized: function () {
+      statusEl.textContent = '';
+      // the fractal build titles its SDL window "Fractal Tetris"
+      setTimeout(function () {
+        var isFractal = document.title.indexOf('Fractal') !== -1;
+        document.getElementById('zoomhelp').hidden = !isFractal;
+        if (!isFractal)
+          document.querySelectorAll('.zoomer').forEach(function (b) {
+            b.classList.add('ghost');
+          });
+      }, 100);
+    }
+  };
+
+  /* touch buttons -> synthetic key events; press-and-hold works because
+     SDL tracks key state until the matching keyup */
+  document.querySelectorAll('.tbtn[data-k]').forEach(function (el) {
+    var parts = el.getAttribute('data-k').split(',');
+    var code = parts[0], kc = parseInt(parts[1], 10);
+    function fire(type) {
+      window.dispatchEvent(new KeyboardEvent(type, {
+        code: code, keyCode: kc, which: kc, bubbles: true
+      }));
+    }
+    function down(e) { e.preventDefault(); fire('keydown'); }
+    function up(e) { e.preventDefault(); fire('keyup'); }
+    el.addEventListener('touchstart', down, { passive: false });
+    el.addEventListener('touchend', up, { passive: false });
+    el.addEventListener('touchcancel', up, { passive: false });
+    el.addEventListener('mousedown', down);
+    el.addEventListener('mouseup', up);
+    el.addEventListener('mouseleave', function () { fire('keyup'); });
+  });
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

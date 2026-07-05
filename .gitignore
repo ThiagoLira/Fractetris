@@ -1,0 +1,6 @@
+build/
+build-web/
+compile_commands.json
+rom/
+reference/
+.playwright-mcp/
