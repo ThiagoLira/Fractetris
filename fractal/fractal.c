@@ -31,6 +31,7 @@
 #include "../src/input.c"
 #include "../src/game.c"
 
+#include <math.h>
 #include <SDL.h>
 #include <GLES3/gl3.h>
 #include <dirent.h>
@@ -786,12 +787,25 @@ static void frame(void)
                 pack_cycle();
             break;
         case SDL_MOUSEWHEEL: {
+            /* smooth/high-res wheels deliver fractional steps: the integer
+             * wheel.y is 0 for most events, so scale by the float delta
+             * instead of treating y<=0 as zoom-out */
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+            double steps = ev.wheel.preciseY;
+#else
+            double steps = ev.wheel.y;
+#endif
+            if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+                steps = -steps;
+            if (steps == 0.0)
+                break;
+            if (steps > 3.0) steps = 3.0;
+            if (steps < -3.0) steps = -3.0;
             int mx, my;
             SDL_GetMouseState(&mx, &my);
             double wx = cam_x + (mx - win_w * 0.5) / cam_scale;
             double wy = cam_y + (my - win_h * 0.5) / cam_scale;
-            double f = ev.wheel.y > 0 ? 1.2 : 1.0 / 1.2;
-            cam_scale *= f;
+            cam_scale *= pow(1.2, steps);
             if (cam_scale < 2.0) cam_scale = 2.0;
             if (cam_scale > 4000.0) cam_scale = 4000.0;
             cam_x = wx - (mx - win_w * 0.5) / cam_scale;
