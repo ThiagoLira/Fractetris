@@ -26,16 +26,34 @@
   }
   #controls b { color: #cdd6c8; font-weight: 600; }
   #about {
-    font-size: 12.5px; line-height: 1.55; text-align: center;
-    color: #8a9a83; max-width: min(90vw, 580px);
+    font-size: 13.5px; line-height: 1.55; text-align: center;
+    color: #a8b8a0; max-width: min(90vw, 620px);
   }
-  #about em { color: #b7c7ae; font-style: normal; font-weight: 600; }
+  #about em { color: #dce8d6; font-style: normal; font-weight: 600; }
+  #about-btn { display: none; }
 
   /* ---- touch controls (mobile only) ---- */
   #touch { display: none; }
   @media (pointer: coarse) {
     #controls { display: none; }
-    #about { font-size: 11.5px; padding-bottom: 140px; } /* clear the pads */
+    /* text lives behind a "What am I seeing?" button */
+    #about-btn {
+      display: inline-block;
+      background: #1d231b; color: #cdd6c8;
+      border: 1px solid #3a4437; border-radius: 999px;
+      font: 600 12px system-ui, sans-serif;
+      padding: 6px 14px; letter-spacing: .5px;
+      -webkit-user-select: none; user-select: none;
+    }
+    #about { display: none; }
+    #about.open {
+      display: block;
+      position: fixed; top: 14%; left: 50%; transform: translateX(-50%);
+      width: min(92vw, 480px); box-sizing: border-box;
+      background: #1d231b; border: 1px solid #3a4437; border-radius: 12px;
+      padding: 14px 16px; z-index: 20; font-size: 13px; text-align: left;
+      box-shadow: 0 8px 30px rgba(0,0,0,.6);
+    }
     #touch { display: block; }
     body { justify-content: flex-start; padding-top: 8px; }
     canvas { width: 98vw; }
@@ -65,16 +83,7 @@
 </style>
 </head>
 <body>
-<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
-<div id="status">loading…</div>
-<div id="controls">
-  <b>&larr;&darr;&rarr;</b> move &middot; <b>Z</b>/<b>X</b> rotate &middot;
-  <b>Enter</b> start/pause &middot; <b>Tab</b> hide preview
-  <span id="zoomhelp" hidden><br>
-  <b>scroll</b> or <b>=</b>/<b>-</b> zoom &middot; <b>drag</b> pan &middot;
-  <b>Home</b> fit view &middot; <b>T</b> switch skin
-  </span>
-</div>
+<button id="about-btn" type="button">What am I seeing?</button>
 <div id="about">
   <span id="about-fractal" hidden>
   What you're seeing: one Game Boy Tetris screen &mdash; except <em>every
@@ -91,6 +100,16 @@
   tables, the quirky piece randomizer, line-clear timings and all &mdash;
   reverse-engineered from the original assembly into C, dressed in Rio
   scenery.
+  </span>
+</div>
+<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<div id="status">loading…</div>
+<div id="controls">
+  <b>&larr;&darr;&rarr;</b> move &middot; <b>Z</b>/<b>X</b> rotate &middot;
+  <b>Enter</b> start/pause &middot; <b>Tab</b> hide preview
+  <span id="zoomhelp" hidden><br>
+  <b>scroll</b> or <b>=</b>/<b>-</b> zoom &middot; <b>drag</b> pan &middot;
+  <b>Home</b> fit view &middot; <b>T</b> switch skin
   </span>
 </div>
 <div id="touch">
@@ -149,6 +168,15 @@
     c.style.aspectRatio = 'auto';
   }
   window.addEventListener('resize', snapCanvas);
+
+  /* mobile: the about text sits behind the "What am I seeing?" button */
+  var aboutEl = document.getElementById('about');
+  document.getElementById('about-btn').addEventListener('click', function () {
+    aboutEl.classList.toggle('open');
+  });
+  aboutEl.addEventListener('click', function () {
+    aboutEl.classList.remove('open');
+  });
 
   /* touch buttons -> synthetic key events; press-and-hold works because
      SDL tracks key state until the matching keyup */
