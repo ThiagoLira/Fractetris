@@ -54,9 +54,11 @@ static int running = 1;
 
 static uint32_t fb[GB_W * GB_H];
 
-static GLuint prog_reg, prog_shadow, prog_disp, prog_show;
+static GLuint prog_reg, prog_shadow, prog_disp, prog_show, prog_tint;
 static GLuint tex_big, tex_tiles, tex_menus;
 static GLuint tex_reg[2], tex_shadow[2], tex_disp[2];
+static GLuint tex_tint[2];
+static int tint_cur;
 static GLuint fbo;
 static GLuint vao;
 static int cur;
@@ -65,8 +67,68 @@ static int frame_no;
 static double cam_x = GAMES_X / 2.0, cam_y = GAMES_Y / 2.0, cam_scale = 8.0;
 static int dragging;
 
+/* ---- recursive zoom ----
+ * Every sub-pixel of every micro-game opens into the whole wall again.
+ * The camera lives in the coordinates of the CURRENT level (precision
+ * resets on every descend); the stack remembers which pixel of which
+ * game we went into, both to climb back out and to rebuild the ancestor
+ * tint chain each frame. One level = x160 games, x160 pixels: 25600. */
+#define MAX_DEPTH 48
+#define CHILD_KX 160.0
+#define CHILD_KY (160.0 * 160.0 / 144.0) /* wall letterboxed in the pixel */
+#define CHILD_YOFF ((CHILD_KY - 144.0) / 2.0)
+static int depth;
+static struct { int gx, gy, px, py; } dstack[MAX_DEPTH];
+
+static void camera_normalize(void)
+{
+    for (;;) {
+        /* ascend: the child wall has shrunk to less than half the view */
+        if (depth > 0 && cam_scale * 160.0 < 0.45 * win_w) {
+            depth--;
+            double qx = cam_x / CHILD_KX;
+            double qy = (cam_y + CHILD_YOFF) / CHILD_KY;
+            cam_x = dstack[depth].gx + (dstack[depth].px + qx) / 160.0;
+            cam_y = dstack[depth].gy + (dstack[depth].py + qy) / 144.0;
+            cam_scale *= 25600.0;
+            continue;
+        }
+        /* descend: the viewport fits inside one sub-pixel */
+        if (depth < MAX_DEPTH) {
+            double hx = win_w / cam_scale * 80.0;  /* half view, sub-pixel u */
+            double hy = win_h / cam_scale * 72.0;
+            if (hx < 0.48 && hy < 0.48) {
+                int gx = (int)floor(cam_x), gy = (int)floor(cam_y);
+                double fx = cam_x - gx, fy = cam_y - gy;
+                int px = (int)(fx * 160.0), py = (int)(fy * 144.0);
+                double qx = fx * 160.0 - px, qy = fy * 144.0 - py;
+                if (gx >= 0 && gx < 160 && gy >= 0 && gy < 144 &&
+                    qx - hx > 0.0 && qx + hx < 1.0 &&
+                    qy - hy > 0.0 && qy + hy < 1.0) {
+                    dstack[depth].gx = gx;
+                    dstack[depth].gy = gy;
+                    dstack[depth].px = px;
+                    dstack[depth].py = py;
+                    depth++;
+                    cam_x = qx * CHILD_KX;
+                    cam_y = qy * CHILD_KY - CHILD_YOFF;
+                    cam_scale /= 25600.0;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if (depth == 0 && cam_scale < 2.0)
+        cam_scale = 2.0;
+    /* only reachable stuck on a sub-pixel boundary or at MAX_DEPTH */
+    if (cam_scale > 1.0e7)
+        cam_scale = 1.0e7;
+}
+
 static void fit_view(void)
 {
+    depth = 0;
     cam_x = GAMES_X / 2.0;
     cam_y = GAMES_Y / 2.0;
     cam_scale = win_w / (double)GAMES_X;
@@ -363,86 +425,124 @@ static const char *FS_DISP = SIM_COMMON
     "O=((act&A_SHIFT)!=0)?shifted(g,mr,mc):scell(g,mr,mc);return;}"
     "O=self;}";
 
-static const char *FS_SHOW =
-    "#version 300 es\n"
-    "precision highp float; precision highp int;\n"
-    "uniform sampler2D uDisp; uniform sampler2D uReg;"
-    "uniform sampler2D uBig; uniform sampler2D uTiles;"
-    "uniform sampler2D uMenus;\n"
-    "uniform vec2 uRes; uniform vec2 uCam; uniform float uScale;"
-    "uniform int uFrame;\n"
-    "const uint P[28]=uint[28]("
-    "0x1700u,0x6220u,0x0740u,0x2230u,0x4700u,0x2260u,0x0710u,0x3220u,"
-    "0x0F00u,0x2222u,0x0F00u,0x2222u,0x6600u,0x6600u,0x6600u,0x6600u,"
-    "0x6300u,0x1320u,0x6300u,0x1320u,0x3600u,0x2310u,0x3600u,0x2310u,"
-    "0x2700u,0x2620u,0x0720u,0x2320u);\n"
-    "const int GB=39;\n"
-    "const int TILE[7]=int[7](20,17,0,19,18,22,21);\n"
-    "int tileFor(int id,int rot,int r,int c){"
-    "if(id==2){if((rot&1)==0)return c==0?26:(c==3?31:27);"
-    "return r==0?16:(r==3?25:24);}return TILE[id];}\n"
-    "float tilepx(int t,vec2 tv){"
-    "return texelFetch(uTiles,ivec2(t*8+int(tv.x*8.0),int(tv.y*8.0)),0).r;}\n"
-    "const int LSCORE[5]=int[5](0x1C,0x0C,0x18,0x1B,0x0E);\n"
-    "const int LLEVEL[5]=int[5](0x15,0x0E,0x1F,0x0E,0x15);\n"
-    "const int LLINES[5]=int[5](0x15,0x12,0x17,0x0E,0x1C);\n"
-    "int dig(int v,int i,int n){"
-    "int p=1;for(int k=1;k<n-i;k++)p*=10;"
-    "if(i<n-1&&v<p)return -1;return (v/p)%10;}\n"
+/* wallpix(): the flat color of any point of the wall of games — the whole
+ * old FS_SHOW as a function. Shared by the display shader (which calls it
+ * twice: once for the point itself, once for the child level previewed
+ * inside big sub-pixels) and the 1x1 tint-chain shader. */
+#define WALL_COMMON \
+    "#version 300 es\n" \
+    "precision highp float; precision highp int;\n" \
+    "uniform sampler2D uDisp; uniform sampler2D uReg;" \
+    "uniform sampler2D uBig; uniform sampler2D uTiles;" \
+    "uniform sampler2D uMenus; uniform int uFrame;\n" \
+    "const uint P[28]=uint[28](" \
+    "0x1700u,0x6220u,0x0740u,0x2230u,0x4700u,0x2260u,0x0710u,0x3220u," \
+    "0x0F00u,0x2222u,0x0F00u,0x2222u,0x6600u,0x6600u,0x6600u,0x6600u," \
+    "0x6300u,0x1320u,0x6300u,0x1320u,0x3600u,0x2310u,0x3600u,0x2310u," \
+    "0x2700u,0x2620u,0x0720u,0x2320u);\n" \
+    "const int GB=39;\n" \
+    "const int TILE[7]=int[7](20,17,0,19,18,22,21);\n" \
+    "int tileFor(int id,int rot,int r,int c){" \
+    "if(id==2){if((rot&1)==0)return c==0?26:(c==3?31:27);" \
+    "return r==0?16:(r==3?25:24);}return TILE[id];}\n" \
+    "float tilepx(int t,vec2 tv){" \
+    "return texelFetch(uTiles,ivec2(t*8+int(tv.x*8.0),int(tv.y*8.0)),0).r;}\n" \
+    "const int LSCORE[5]=int[5](0x1C,0x0C,0x18,0x1B,0x0E);\n" \
+    "const int LLEVEL[5]=int[5](0x15,0x0E,0x1F,0x0E,0x15);\n" \
+    "const int LLINES[5]=int[5](0x15,0x12,0x17,0x0E,0x1C);\n" \
+    "int dig(int v,int i,int n){" \
+    "int p=1;for(int k=1;k<n-i;k++)p*=10;" \
+    "if(i<n-1&&v<p)return -1;return (v/p)%10;}\n" \
+    "vec3 wallpix(ivec2 g,vec2 fr){" \
+    "if(g.x<0||g.y<0||g.x>=160||g.y>=144)return vec3(0.02,0.02,0.03);" \
+    "vec3 big=texelFetch(uBig,g,0).rgb;" \
+    "int vc=int(fr.x*20.0),vr=int(fr.y*18.0);" \
+    "vec2 tv=vec2(fract(fr.x*20.0),fract(fr.y*18.0));" \
+    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*5,g.y),0)*255.0+0.5);" \
+    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*5+1,g.y),0)*255.0+0.5);" \
+    "ivec4 d3=ivec4(texelFetch(uReg,ivec2(g.x*5+3,g.y),0)*255.0+0.5);" \
+    "ivec4 e=ivec4(texelFetch(uReg,ivec2(g.x*5+4,g.y),0)*255.0+0.5);" \
+    "int lockst=a.a>>3&3,wipe=b.a&31,mode=d3.g>>5;" \
+    /* booting games show the real menu screens (pre-rendered by the C
+     * engine), with the blinking selection overlaid by the shader */ \
+    "if(mode>=3){" \
+    "ivec2 sp=ivec2(int(fr.x*160.0),int(fr.y*144.0)+(mode-3)*144);" \
+    "vec3 mpx=texelFetch(uMenus,sp,0).rgb;" \
+    "float lum=dot(mpx,vec3(0.30,0.59,0.11));" \
+    "bool blink=((uFrame>>4)&1)==0;" \
+    "int mvc=int(fr.x*20.0),mvr=int(fr.y*18.0);" \
+    "if(mode==4&&blink&&mvr==5&&mvc>=3&&mvc<=8)lum=1.0-lum;" \
+    "if(mode==5&&blink&&mvr==6&&mvc==5)lum=1.0-lum;" \
+    "return big*lum;}" \
+    "float grey=1.0;int tile=-1;" \
+    "if(vc==1||vc==12){tile=GB+11;}" \
+    "else if(vc==0){grey=0.75;}" \
+    "else if(vc>=2&&vc<=11){" \
+    "int mc=vc-2,mr=vr;" \
+    "vec4 cell=texelFetch(uDisp,ivec2(g.x*10+mc,g.y*18+mr),0);" \
+    "if(cell.r>0.5)tile=GB+int(cell.g*255.0+0.5);" \
+    /* active piece: hidden while locked/wiping, like the OAM hide */ \
+    "if(mode==0&&lockst==0&&wipe==0){" \
+    "int px=(a.r&15)-1,rot=a.r>>4,py=a.g-2,id=a.b&7;" \
+    "int pr=mr-py,pc=mc-px;" \
+    "if(pr>=0&&pr<4&&pc>=0&&pc<4&&(P[id*4+rot]>>uint(pr*4+pc)&1u)!=0u)" \
+    "tile=GB+tileFor(id,rot,pr,pc);}" \
+    "}else{" \
+    "int score=e.r|e.g<<8|e.b<<16;" \
+    "int level=d3.g&31,lines=d3.r;" \
+    "if(vr==1&&vc>=13&&vc<=17)tile=LSCORE[vc-13];" \
+    "else if(vr==3&&vc>=13&&vc<=18){int t=dig(score,vc-13,6);" \
+    "if(t>=0)tile=t;}" \
+    "else if(vr==6&&vc>=13&&vc<=17)tile=LLEVEL[vc-13];" \
+    "else if(vr==7&&(vc==16||vc==17)){int t=dig(level,vc-16,2);" \
+    "if(t>=0)tile=t;}" \
+    "else if(vr==9&&vc>=13&&vc<=17)tile=LLINES[vc-13];" \
+    "else if(vr==10&&vc>=14&&vc<=17){int t=dig(lines,vc-14,4);" \
+    "if(t>=0)tile=t;}" \
+    "}" \
+    "if(tile>=0)grey=tilepx(tile,tv);" \
+    "return big*grey;}\n" \
+    /* per-level tint: inherit the ancestor pixel's hue, renormalized so
+     * deep levels stay visible instead of multiplying down to black */ \
+    "vec3 tintstep(vec3 T,vec3 c){vec3 t=T*(0.35+0.65*c);" \
+    "float m=max(t.r,max(t.g,t.b));return t/max(m,0.55);}\n"
+
+/* Every sub-pixel of every micro-game contains the whole wall again
+ * (Life-Universe style self-similarity: one simulation, every level shows
+ * it). A pixel is 1/160 x 1/144 of a game; the child wall is drawn in it
+ * at a uniform 1/25600 scale, letterboxed vertically, so the zoom factor
+ * per level is isotropic and the camera can re-base losslessly. */
+static const char *FS_SHOW = WALL_COMMON
+    "uniform vec2 uRes; uniform ivec2 uCamG; uniform vec2 uCamF;"
+    "uniform float uScale; uniform sampler2D uTint;\n"
     "out vec4 O;\n"
     "void main(){"
-    "vec2 w=uCam+vec2(gl_FragCoord.x-uRes.x*0.5,"
+    "vec2 loc=vec2(gl_FragCoord.x-uRes.x*0.5,"
     "uRes.y*0.5-gl_FragCoord.y)/uScale;"
-    "if(w.x<0.0||w.y<0.0||w.x>=160.0||w.y>=144.0)"
-    "{O=vec4(0.02,0.02,0.03,1.0);return;}"
-    "ivec2 g=ivec2(w);vec2 fr=fract(w);"
-    "vec3 big=texelFetch(uBig,g,0).rgb;"
-    "int vc=int(fr.x*20.0),vr=int(fr.y*18.0);"
-    "vec2 tv=vec2(fract(fr.x*20.0),fract(fr.y*18.0));"
-    "ivec4 a=ivec4(texelFetch(uReg,ivec2(g.x*5,g.y),0)*255.0+0.5);"
-    "ivec4 b=ivec4(texelFetch(uReg,ivec2(g.x*5+1,g.y),0)*255.0+0.5);"
-    "ivec4 d3=ivec4(texelFetch(uReg,ivec2(g.x*5+3,g.y),0)*255.0+0.5);"
-    "ivec4 e=ivec4(texelFetch(uReg,ivec2(g.x*5+4,g.y),0)*255.0+0.5);"
-    "int lockst=a.a>>3&3,wipe=b.a&31,mode=d3.g>>5;"
-    /* booting games show the real menu screens (pre-rendered by the C
-     * engine), with the blinking selection overlaid by the shader */
-    "if(mode>=3){"
-    "ivec2 sp=ivec2(int(fr.x*160.0),int(fr.y*144.0)+(mode-3)*144);"
-    "vec3 mpx=texelFetch(uMenus,sp,0).rgb;"
-    "float lum=dot(mpx,vec3(0.30,0.59,0.11));"
-    "bool blink=((uFrame>>4)&1)==0;"
-    "int mvc=int(fr.x*20.0),mvr=int(fr.y*18.0);"
-    "if(mode==4&&blink&&mvr==5&&mvc>=3&&mvc<=8)lum=1.0-lum;"
-    "if(mode==5&&blink&&mvr==6&&mvc==5)lum=1.0-lum;"
-    "O=vec4(big*lum,1.0);return;}"
-    "float grey=1.0;int tile=-1;"
-    "if(vc==1||vc==12){tile=GB+11;}"
-    "else if(vc==0){grey=0.75;}"
-    "else if(vc>=2&&vc<=11){"
-    "int mc=vc-2,mr=vr;"
-    "vec4 cell=texelFetch(uDisp,ivec2(g.x*10+mc,g.y*18+mr),0);"
-    "if(cell.r>0.5)tile=GB+int(cell.g*255.0+0.5);"
-    /* active piece: hidden while locked/wiping, like the OAM hide */
-    "if(mode==0&&lockst==0&&wipe==0){"
-    "int px=(a.r&15)-1,rot=a.r>>4,py=a.g-2,id=a.b&7;"
-    "int pr=mr-py,pc=mc-px;"
-    "if(pr>=0&&pr<4&&pc>=0&&pc<4&&(P[id*4+rot]>>uint(pr*4+pc)&1u)!=0u)"
-    "tile=GB+tileFor(id,rot,pr,pc);}"
-    "}else{"
-    "int score=e.r|e.g<<8|e.b<<16;"
-    "int level=d3.g&31,lines=d3.r;"
-    "if(vr==1&&vc>=13&&vc<=17)tile=LSCORE[vc-13];"
-    "else if(vr==3&&vc>=13&&vc<=18){int t=dig(score,vc-13,6);"
-    "if(t>=0)tile=t;}"
-    "else if(vr==6&&vc>=13&&vc<=17)tile=LLEVEL[vc-13];"
-    "else if(vr==7&&(vc==16||vc==17)){int t=dig(level,vc-16,2);"
-    "if(t>=0)tile=t;}"
-    "else if(vr==9&&vc>=13&&vc<=17)tile=LLINES[vc-13];"
-    "else if(vr==10&&vc>=14&&vc<=17){int t=dig(lines,vc-14,4);"
-    "if(t>=0)tile=t;}"
-    "}"
-    "if(tile>=0)grey=tilepx(tile,tv);"
-    "O=vec4(big*grey,1.0);}";
+    "vec2 wl=uCamF+loc;"
+    "vec2 fl=floor(wl);"
+    "ivec2 g=uCamG+ivec2(fl);"
+    "vec2 fr=wl-fl;"
+    "vec3 T=texelFetch(uTint,ivec2(0),0).rgb;"
+    "vec3 base=wallpix(g,fr);"
+    "vec3 col=T*base;"
+    /* child level fades in once a sub-pixel is ~a hundred px tall */
+    "float fade=smoothstep(64.0,200.0,uScale/144.0);"
+    "if(fade>0.0){"
+    "vec2 sp=fr*vec2(160.0,144.0);"
+    "vec2 q=sp-floor(sp);"
+    "vec2 cw=vec2(q.x*160.0,q.y*177.77778-16.888889);"
+    "vec2 cf=floor(cw);"
+    "vec3 child=wallpix(ivec2(cf),cw-cf);"
+    "col=mix(col,tintstep(T,base)*child,fade);}"
+    "O=vec4(col,1.0);}";
+
+/* 1x1 pass: fold one descend point into the ancestor tint chain */
+static const char *FS_TINT = WALL_COMMON
+    "uniform ivec2 uPtG; uniform vec2 uPtF; uniform sampler2D uTint;\n"
+    "out vec4 O;\n"
+    "void main(){vec3 T=texelFetch(uTint,ivec2(0),0).rgb;"
+    "O=vec4(tintstep(T,wallpix(uPtG,uPtF)),1.0);}";
 
 /* ---------------- GL helpers ---------------- */
 
@@ -738,10 +838,8 @@ static void sim_tick(void)
     frame_no++;
 }
 
-static void draw(void)
+static void bind_wall_inputs(GLuint prog)
 {
-    glViewport(0, 0, win_w, win_h);
-    glUseProgram(prog_show);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_disp[cur]);
     glActiveTexture(GL_TEXTURE1);
@@ -752,16 +850,62 @@ static void draw(void)
     glBindTexture(GL_TEXTURE_2D, tex_tiles);
     glActiveTexture(GL_TEXTURE4);
     glBindTexture(GL_TEXTURE_2D, tex_menus);
-    glUniform1i(glGetUniformLocation(prog_show, "uDisp"), 0);
-    glUniform1i(glGetUniformLocation(prog_show, "uReg"), 1);
-    glUniform1i(glGetUniformLocation(prog_show, "uBig"), 2);
-    glUniform1i(glGetUniformLocation(prog_show, "uTiles"), 3);
-    glUniform1i(glGetUniformLocation(prog_show, "uMenus"), 4);
-    glUniform1i(glGetUniformLocation(prog_show, "uFrame"), frame_no);
+    glUniform1i(glGetUniformLocation(prog, "uDisp"), 0);
+    glUniform1i(glGetUniformLocation(prog, "uReg"), 1);
+    glUniform1i(glGetUniformLocation(prog, "uBig"), 2);
+    glUniform1i(glGetUniformLocation(prog, "uTiles"), 3);
+    glUniform1i(glGetUniformLocation(prog, "uMenus"), 4);
+    glUniform1i(glGetUniformLocation(prog, "uFrame"), frame_no);
+}
+
+/* rebuild the ancestor tint chain (live: ancestors keep playing) */
+static void tint_update(void)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex_tint[0], 0);
+    glViewport(0, 0, 1, 1);
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    tint_cur = 0;
+    glUseProgram(prog_tint);
+    for (int d = 0; d < depth; d++) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex_tint[tint_cur ^ 1], 0);
+        bind_wall_inputs(prog_tint);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, tex_tint[tint_cur]);
+        glUniform1i(glGetUniformLocation(prog_tint, "uTint"), 5);
+        glUniform2i(glGetUniformLocation(prog_tint, "uPtG"),
+                    dstack[d].gx, dstack[d].gy);
+        glUniform2f(glGetUniformLocation(prog_tint, "uPtF"),
+                    (dstack[d].px + 0.5f) / 160.0f,
+                    (dstack[d].py + 0.5f) / 144.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        tint_cur ^= 1;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+static void draw(void)
+{
+    tint_update();
+
+    glViewport(0, 0, win_w, win_h);
+    glUseProgram(prog_show);
+    bind_wall_inputs(prog_show);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, tex_tint[tint_cur]);
+    glUniform1i(glGetUniformLocation(prog_show, "uTint"), 5);
     glUniform2f(glGetUniformLocation(prog_show, "uRes"),
                 (float)win_w, (float)win_h);
-    glUniform2f(glGetUniformLocation(prog_show, "uCam"),
-                (float)cam_x, (float)cam_y);
+    /* camera split into whole game + fraction so deep-zoom fragments
+     * keep float precision near the camera */
+    double cgx = floor(cam_x), cgy = floor(cam_y);
+    glUniform2i(glGetUniformLocation(prog_show, "uCamG"),
+                (int)cgx, (int)cgy);
+    glUniform2f(glGetUniformLocation(prog_show, "uCamF"),
+                (float)(cam_x - cgx), (float)(cam_y - cgy));
     glUniform1f(glGetUniformLocation(prog_show, "uScale"),
                 (float)cam_scale);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -806,10 +950,10 @@ static void frame(void)
             double wx = cam_x + (mx - win_w * 0.5) / cam_scale;
             double wy = cam_y + (my - win_h * 0.5) / cam_scale;
             cam_scale *= pow(1.2, steps);
-            if (cam_scale < 2.0) cam_scale = 2.0;
-            if (cam_scale > 4000.0) cam_scale = 4000.0;
+            if (depth == 0 && cam_scale < 2.0) cam_scale = 2.0;
             cam_x = wx - (mx - win_w * 0.5) / cam_scale;
             cam_y = wy - (my - win_h * 0.5) / cam_scale;
+            camera_normalize();
             break;
         }
         case SDL_MOUSEBUTTONDOWN: dragging = 1; break;
@@ -818,6 +962,7 @@ static void frame(void)
             if (dragging) {
                 cam_x -= ev.motion.xrel / cam_scale;
                 cam_y -= ev.motion.yrel / cam_scale;
+                camera_normalize();
             }
             break;
         case SDL_WINDOWEVENT:
@@ -839,8 +984,8 @@ static void frame(void)
             f = 1.0 / 1.04;
         if (f != 1.0) {
             cam_scale *= f;
-            if (cam_scale < 2.0) cam_scale = 2.0;
-            if (cam_scale > 4000.0) cam_scale = 4000.0;
+            if (depth == 0 && cam_scale < 2.0) cam_scale = 2.0;
+            camera_normalize();
         }
         if (k[SDL_SCANCODE_HOME])
             fit_view();
@@ -914,6 +1059,9 @@ int main(int argc, char **argv)
     prog_shadow = link2(FS_SHADOW);
     prog_disp = link2(FS_DISP);
     prog_show = link2(FS_SHOW);
+    prog_tint = link2(FS_TINT);
+    for (int i = 0; i < 2; i++)
+        tex_tint[i] = make_tex(1, 1, NULL);
 
     game_seed((unsigned)SDL_GetPerformanceCounter());
     srand((unsigned)SDL_GetPerformanceCounter());
@@ -943,6 +1091,20 @@ int main(int argc, char **argv)
             cam_x = atof(getenv("FRACTAL_CX"));
         if (getenv("FRACTAL_CY"))
             cam_y = atof(getenv("FRACTAL_CY"));
+        /* FRACTAL_DESCEND=n: recurse n levels into the sub-pixel under
+         * the camera (testing hook for the infinite zoom) */
+        if (getenv("FRACTAL_DESCEND")) {
+            int nd = atoi(getenv("FRACTAL_DESCEND"));
+            for (int i = 0; i < nd; i++) {
+                int gx = (int)floor(cam_x), gy = (int)floor(cam_y);
+                double fx = cam_x - gx, fy = cam_y - gy;
+                int px = (int)(fx * 160.0), py = (int)(fy * 144.0);
+                cam_x = gx + (px + 0.5) / 160.0;
+                cam_y = gy + (py + 0.5) / 144.0;
+                cam_scale = 200.0 * win_w;
+                camera_normalize();
+            }
+        }
         for (int i = 0; i < n; i++) {
             Input in = { 0, 0 };
             game_update(in);
