@@ -25,11 +25,17 @@
     color: #9fb097; max-width: 90vw;
   }
   #controls b { color: #cdd6c8; font-weight: 600; }
+  #about {
+    font-size: 12.5px; line-height: 1.55; text-align: center;
+    color: #8a9a83; max-width: min(90vw, 580px);
+  }
+  #about em { color: #b7c7ae; font-style: normal; font-weight: 600; }
 
   /* ---- touch controls (mobile only) ---- */
   #touch { display: none; }
   @media (pointer: coarse) {
     #controls { display: none; }
+    #about { font-size: 11.5px; padding-bottom: 140px; } /* clear the pads */
     #touch { display: block; }
     body { justify-content: flex-start; padding-top: 8px; }
     canvas { width: 98vw; }
@@ -66,8 +72,25 @@
   <b>Enter</b> start/pause &middot; <b>Tab</b> hide preview
   <span id="zoomhelp" hidden><br>
   <b>scroll</b> or <b>=</b>/<b>-</b> zoom &middot; <b>drag</b> pan &middot;
-  <b>Home</b> fit view &middot; <b>T</b> switch skin &mdash; every pixel is
-  its own little game, zoom in!
+  <b>Home</b> fit view &middot; <b>T</b> switch skin
+  </span>
+</div>
+<div id="about">
+  <span id="about-fractal" hidden>
+  What you're seeing: one Game Boy Tetris screen &mdash; except <em>every
+  single pixel of it is also a complete Tetris game</em>. All 23,040 of them
+  play themselves in parallel on your GPU, and each one is tinted by the
+  color of its pixel in the big game, so together they form the picture.
+  Zoom in and the image dissolves into thousands of tiny live boards; zoom
+  out and their brightness reassembles the screen you were just playing.
+  Big game and micro-games alike run a faithful recreation of the original
+  1989 Game Boy code.
+  </span>
+  <span id="about-classic" hidden>
+  A faithful recreation of the original 1989 Game Boy Tetris &mdash; gravity
+  tables, the quirky piece randomizer, line-clear timings and all &mdash;
+  reverse-engineered from the original assembly into C, dressed in Rio
+  scenery.
   </span>
 </div>
 <div id="touch">
@@ -102,6 +125,8 @@
       setTimeout(function () {
         var isFractal = document.title.indexOf('classic') === -1;
         document.getElementById('zoomhelp').hidden = !isFractal;
+        document.getElementById('about-fractal').hidden = !isFractal;
+        document.getElementById('about-classic').hidden = isFractal;
         if (!isFractal)
           document.querySelectorAll('.zoomer').forEach(function (b) {
             b.classList.add('ghost');
