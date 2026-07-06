@@ -5,7 +5,9 @@ the game**. You play a Game Boy-style puzzle game at 160×144 — and each of
 those 23,040 pixels is a live micro-game with its own board, simulated
 entirely on the GPU in fragment shaders, tinted by the color of its pixel in
 the main game. Zoom in and the image you were just playing dissolves into
-thousands of tiny self-playing boards.
+thousands of tiny self-playing boards — and it doesn't stop there: **every
+pixel of every micro-game opens into the whole wall again**, recursively,
+forever.
 
 Under the hood this is a **full recreation of the original Game Boy game**,
 recompiled by hand twice: the original assembly (Tetris World, Rev 1
@@ -34,6 +36,14 @@ original game logic.
   advance all 23,040 games each frame — the same call order, stage timings,
   RNG chain, input path (a virtual player's button bytes go through the real
   DAS code) and scoring as the C port, which is to say, as the original ROM.
+- **The zoom is infinite**, in the spirit of saharan's [Life
+  Universe](https://oimo.io/works/life/): one simulation, self-similar at
+  every level. Each sub-pixel of each micro-game contains the whole wall
+  again, tinted by the chain of pixels you descended through (rebuilt live
+  each frame by a chain of 1×1 shader passes). The camera re-bases its
+  coordinates on every descend — ×25,600 per level — so float precision
+  resets and you can zoom until the depth counter, not the arithmetic,
+  gives out.
 - One codebase, three artifacts: `tetris` (the classic-style game),
   `fractal` (the per-pixel meta-game), and a single-file amalgamation.
 
@@ -54,8 +64,9 @@ python3 -m http.server -d build-web 8000
 ## Controls
 
 Arrows/WASD move, Z/X rotate, Enter starts/pauses, Tab hides the preview.
-In the fractal build: mouse wheel or `=`/`-` zooms, drag pans, `Home` fits
-the whole wall of games on screen. Touch controls appear on mobile.
+In the fractal build: mouse wheel or `=`/`-` zooms (keep going — it
+recurses), drag pans, `Home` fits the whole wall of games on screen and
+resets the depth. Touch controls appear on mobile.
 Joysticks work via the plain SDL joystick API.
 
 ## Assets
